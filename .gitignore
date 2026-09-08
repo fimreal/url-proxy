@@ -1,0 +1,10 @@
+# Binaries and coverage
+url-proxy
+coverage.out
+*.log
+
+# Multica runtime metadata
+.agents
+.multica
+.agent_context
+AGENTS.md

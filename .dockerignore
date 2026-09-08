@@ -1,0 +1,7 @@
+.git
+.agents
+.multica
+.agent_context
+*.log
+coverage.out
+url-proxy
