@@ -1,16 +1,18 @@
 # syntax=docker/dockerfile:1
 
-# Stage 1: Build static binary
-FROM golang:1.22-alpine AS builder
+# Stage 1: Build static binary with Go native cross-compilation
+FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS builder
 
 WORKDIR /build
 
 COPY go.mod ./
-# Copy source files
 COPY main.go ./
 
-# Compile statically linked, stripped binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o url-proxy .
+ARG TARGETOS
+ARG TARGETARCH
+
+# Fast cross-compilation without QEMU overhead
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -ldflags="-s -w" -o url-proxy .
 
 # Stage 2: Minimal runtime image
 FROM alpine:3.19

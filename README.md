@@ -153,9 +153,22 @@ go build -ldflags="-s -w" -o url-proxy .
 curl -i http://localhost:8080/healthz
 ```
 
-### 场景二：Docker 容器化运行（白名单模式）
+### 场景二：Docker 容器化运行（使用官方多架构镜像）
 
-限制仅允许代理 GitHub 相关生态资源：
+已发布包含 **x86_64 (amd64)** 与 **ARM64** 的官方多架构镜像 `epurs/url-proxy:latest`，开箱即用：
+
+```bash
+# 全放通模式（默认放通所有合法公网域名，内置私网与云元数据 SSRF 防护）
+docker run -d \
+  --name url-proxy \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -e ALLOW_DOMAINS="*" \
+  -e MAX_REDIRECTS=10 \
+  epurs/url-proxy:latest
+```
+
+或仅放行 GitHub 生态域名（白名单模式）：
 
 ```bash
 docker run -d \
@@ -164,7 +177,7 @@ docker run -d \
   -p 8080:8080 \
   -e ALLOW_DOMAINS="*.github.com,github.com,*.githubusercontent.com" \
   -e MAX_REDIRECTS=10 \
-  url-proxy:latest
+  epurs/url-proxy:latest
 ```
 
 使用 Docker Compose 部署示例：
@@ -174,14 +187,14 @@ version: '3.8'
 
 services:
   url-proxy:
-    image: url-proxy:latest
+    image: epurs/url-proxy:latest
     container_name: url-proxy
     restart: always
     ports:
       - "8080:8080"
     environment:
       - PORT=8080
-      - ALLOW_DOMAINS=*.github.com,github.com,*.githubusercontent.com,*.gitlab.com
+      - ALLOW_DOMAINS=*
       - BLOCK_PRIVATE_IPS=true
       - MAX_REDIRECTS=10
       - BUFFER_SIZE_KB=32
@@ -191,6 +204,20 @@ services:
       timeout: 5s
       retries: 3
 ```
+
+---
+
+### CI/CD 自动化构建（兼容 Gitea Actions 与 GitHub Actions）
+
+项目已在 `.gitea/workflows/docker.yaml` 与 `.github/workflows/docker.yaml` 中配置了跨平台 CI 自动化构建流水线：
+- **触发时机**：代码 Push 至 `main` 分支或推送版本 Tag（如 `v1.0.0`），或在 Gitea 界面手动触发（`workflow_dispatch`）。
+- **多平台矩阵**：基于 Docker Buildx 原生交叉编译输出 `linux/amd64` (x86_64) 与 `linux/arm64` 镜像。
+- **凭据要求**：在 Gitea 仓库的 `Settings` -> `Actions` -> `Secrets` 中配置：
+  - `DOCKER_USERNAME`: Docker Hub 用户名（默认 `epurs`）
+  - `DOCKER_PASSWORD`: Docker Hub 访问 Token 或密码
+- **自动打标**：推送至 `main` 自动打 `latest` 标签，发布 Tag 自动打语义化版本标签。
+
+---
 
 ### 场景三：上游挂载 HTTP / SOCKS5 出网代理
 
