@@ -267,6 +267,21 @@ server {
 
 ---
 
+### 场景五：iptables 主机防火墙访问控制（限定单 IP 或网段访问）
+
+由于 Docker 容器默认绕过系统 `INPUT` 链直接经由 `FORWARD` 链进行 DNAT 路由，对容器外部端口进行访问控制时，推荐在 `DOCKER-USER` 链中配置规则：
+
+```bash
+# 仅允许指定来源 IP (例如 10.0.0.98) 访问宿主机上的 18080 端口
+iptables -I DOCKER-USER 1 -i enp0s6 -s 10.0.0.98 -p tcp -m conntrack --ctorigdstport 18080 -j ACCEPT
+iptables -I DOCKER-USER 2 -i enp0s6 -p tcp -m conntrack --ctorigdstport 18080 -j REJECT --reject-with tcp-reset
+
+# 保存规则以便重启持久生效 (Ubuntu/Debian)
+netfilter-persistent save
+```
+
+---
+
 ## API 与接口测试示例
 
 ### 1. 基础下载转发
