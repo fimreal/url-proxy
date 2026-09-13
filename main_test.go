@@ -530,3 +530,75 @@ func TestProxyServer_NoRedirectWhenMaxZero(t *testing.T) {
 		t.Errorf("expected Location header 'https://example.com/target', got %q", loc)
 	}
 }
+
+func TestProxyServer_SSEStreamingChatCompletion(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1. Verify headers
+		if r.Method != "POST" {
+			t.Errorf("expected POST method, got %s", r.Method)
+		}
+		if auth := r.Header.Get("Authorization"); auth != "Bearer sk-test-123456" {
+			t.Errorf("expected Authorization header 'Bearer sk-test-123456', got %q", auth)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("expected Content-Type application/json, got %q", ct)
+		}
+
+		// 2. Verify body
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"stream":true`) {
+			t.Errorf("expected body to contain stream:true, got %s", string(body))
+		}
+
+		// 3. Respond with SSE stream
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, ok := w.(http.Flusher)
+		chunks := []string{
+			"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{\"content\":\" OpenAI\"}}]}\n\n",
+			"data: [DONE]\n\n",
+		}
+		for _, chunk := range chunks {
+			w.Write([]byte(chunk))
+			if ok {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer upstreamServer.Close()
+
+	cfg := &Config{
+		BlockPrivateIPs: false,
+		MaxRedirects:    5,
+		BufferSizeKB:    32,
+	}
+	proxy := NewProxyServer(cfg)
+
+	payload := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest("POST", "/"+upstreamServer.URL+"/v1/chat/completions", strings.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer sk-test-123456")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	res := rec.Result()
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", res.StatusCode)
+	}
+
+	if ct := res.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("expected Content-Type text/event-stream, got %q", ct)
+	}
+
+	respBody, _ := io.ReadAll(res.Body)
+	expectedContent := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" OpenAI\"}}]}\n\ndata: [DONE]\n\n"
+	if string(respBody) != expectedContent {
+		t.Errorf("streamed body mismatch: got %q, expected %q", string(respBody), expectedContent)
+	}
+}

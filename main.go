@@ -534,12 +534,26 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 	// 9. Write response status code
 	w.WriteHeader(upstreamResp.StatusCode)
 
-	// 10. Stream response body to client with zero buffering
+	// 10. Stream response body to client with real-time flushing (supports SSE & LLM streaming)
+	flusher, canFlush := w.(http.Flusher)
 	bufSize := p.cfg.BufferSizeKB * 1024
 	buf := make([]byte, bufSize)
-	_, copyErr := io.CopyBuffer(w, upstreamResp.Body, buf)
-	if copyErr != nil && copyErr != io.EOF {
-		log.Printf("[Stream Error] %s %s -> %v", r.Method, targetURL.String(), copyErr)
+	for {
+		n, readErr := upstreamResp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				break
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if readErr != io.EOF {
+				log.Printf("[Stream Error] %s %s -> %v", r.Method, targetURL.String(), readErr)
+			}
+			break
+		}
 	}
 }
 
