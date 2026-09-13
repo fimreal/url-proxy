@@ -128,31 +128,22 @@
   - 不再主动向目标上游附加 `X-Forwarded-For`，目标服务器在 TCP 与 HTTP 应用层感知到的发起方均为本代理服务器的出网 IP。
 - **透明透传模式**：若需要向内部服务汇报真实来源 IP，只需配置环境变量 `HIDE_CLIENT_IP=false` 或 `FORWARD_CLIENT_IP=true` 即可切回透明转发。
 
-#### 客户端自主选择（单次请求动态切换）
+#### 客户端自主选择（通过 HTTP 请求头动态切换）
 
-除了服务端全局环境变量配置外，**客户端亦可在发起请求时按需自主决定是否携带真实 IP**，支持 Header 与 URL 参数两种方式：
+除了服务端全局环境变量配置外，**客户端亦可在发起请求时按需自主决定是否携带真实 IP**。为保障目标 URL 的绝对纯净（避免破坏 AWS S3 等对象的预签名 URL 校验），本项目**仅通过 HTTP 请求头**提供控制，绝不侵入或修改目标 URL 的 Query 参数：
 
-1. **方式一：通过 HTTP 请求头控制（推荐）**
-   - **携带真实 IP**：在请求头中加入 `X-Forward-Client-IP: true`（或 `1`）
-     ```bash
-     curl -H "X-Forward-Client-IP: true" http://10.0.0.10:18080/https://httpbin.org/ip
-     ```
-   - **隐藏真实 IP**：在请求头中加入 `X-Hide-Client-IP: true`（或 `X-Forward-Client-IP: false`）
-     ```bash
-     curl -H "X-Hide-Client-IP: true" http://10.0.0.10:18080/https://httpbin.org/ip
-     ```
-   *注：代理在向上游转发时会自动剥离所有 `X-Forward-Client-IP` / `X-Hide-Client-IP` 控制头，目标服务端绝不会感知到此内部标记。*
+- **携带真实客户端 IP**：在请求头中加入 `X-Forward-Client-IP: true`（或 `1`）
+  ```bash
+  curl -H "X-Forward-Client-IP: true" http://10.0.0.10:18080/https://httpbin.org/ip
+  ```
+- **隐藏真实客户端 IP（默认行为）**：在请求头中加入 `X-Hide-Client-IP: true`（或 `X-Forward-Client-IP: false`）
+  ```bash
+  curl -H "X-Hide-Client-IP: true" http://10.0.0.10:18080/https://httpbin.org/ip
+  ```
 
-2. **方式二：通过 URL 查询参数控制（便于浏览器/命令行直连）**
-   - **携带真实 IP**：在目标 URL 后追加 `proxy_forward_ip=true`（或 `1`）
-     ```bash
-     curl "http://10.0.0.10:18080/https://httpbin.org/ip?proxy_forward_ip=true"
-     ```
-   - **隐藏真实 IP**：在目标 URL 后追加 `proxy_hide_ip=true`
-     ```bash
-     curl "http://10.0.0.10:18080/https://httpbin.org/ip?proxy_hide_ip=true"
-     ```
-   *注：代理在向上游发起请求前，会自动将 `proxy_forward_ip` / `proxy_hide_ip` 从目标 URL Query 参数中剔除，不污染原本发往目标服务的参数。*
+> **安全与零侵入保证**：
+> 1. 代理服务在向上游转发时会自动剥离所有内部控制头（`X-Forward-Client-IP`、`X-Hide-Client-IP` 等），绝不向目标服务端泄露任何内部标记。
+> 2. 目标 URL 路径与 Query 参数保持 100% 原始字节透传，完全不改变字符编码与参数顺序，兼容所有严格签名校验接口。
 
 ---
 

@@ -843,21 +843,18 @@ func TestProxyServer_ClientChoice_Header(t *testing.T) {
 	}
 }
 
-func TestProxyServer_ClientChoice_QueryParam(t *testing.T) {
-	var receivedHeaders http.Header
+func TestProxyServer_QueryPreservedUntouched(t *testing.T) {
 	var receivedURL string
 	var mu sync.Mutex
 
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		receivedHeaders = r.Header.Clone()
 		receivedURL = r.URL.String()
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer upstreamServer.Close()
 
-	// Default server has HideClientIP: true
 	cfg := &Config{
 		BlockPrivateIPs: false,
 		MaxRedirects:    5,
@@ -866,94 +863,24 @@ func TestProxyServer_ClientChoice_QueryParam(t *testing.T) {
 	}
 	proxy := NewProxyServer(cfg)
 
-	// Case 1: Query param proxy_forward_ip=true with other params
-	{
-		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/api?param=1&proxy_forward_ip=true&token=xyz", nil)
-		req.RemoteAddr = "198.51.100.30:12345"
+	// Verify query string is 100% untouched and preserved
+	rawTarget := "/api?foo=bar&b=2&a=1"
+	req := httptest.NewRequest("GET", "/"+upstreamServer.URL+rawTarget, nil)
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
 
-		rec := httptest.NewRecorder()
-		proxy.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", rec.Code)
-		}
-
-		mu.Lock()
-		headers := receivedHeaders.Clone()
-		u := receivedURL
-		mu.Unlock()
-
-		// Upstream URL must have proxy_forward_ip stripped, other params preserved
-		if strings.Contains(u, "proxy_forward_ip") {
-			t.Errorf("expected proxy_forward_ip to be stripped from upstream URL, got %q", u)
-		}
-		if !strings.Contains(u, "param=1") || !strings.Contains(u, "token=xyz") {
-			t.Errorf("expected original query params preserved, got %q", u)
-		}
-
-		// X-Forwarded-For must be present
-		if !strings.Contains(headers.Get("X-Forwarded-For"), "198.51.100.30") {
-			t.Errorf("expected X-Forwarded-For to contain client IP, got %q", headers.Get("X-Forwarded-For"))
-		}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 
-	// Case 2: Query param proxy_forward_ip=1 as the only param
-	{
-		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/api?proxy_forward_ip=1", nil)
-		req.RemoteAddr = "198.51.100.30:12345"
+	mu.Lock()
+	u := receivedURL
+	mu.Unlock()
 
-		rec := httptest.NewRecorder()
-		proxy.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", rec.Code)
-		}
-
-		mu.Lock()
-		headers := receivedHeaders.Clone()
-		u := receivedURL
-		mu.Unlock()
-
-		if u != "/api" {
-			t.Errorf("expected /api without query string, got %q", u)
-		}
-		if !strings.Contains(headers.Get("X-Forwarded-For"), "198.51.100.30") {
-			t.Errorf("expected X-Forwarded-For to contain client IP, got %q", headers.Get("X-Forwarded-For"))
-		}
-	}
-
-	// Case 3: Server is transparent, client sends ?proxy_hide_ip=true
-	{
-		transparentCfg := &Config{
-			BlockPrivateIPs: false,
-			MaxRedirects:    5,
-			BufferSizeKB:    32,
-			HideClientIP:    false,
-		}
-		transparentProxy := NewProxyServer(transparentCfg)
-
-		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/api?proxy_hide_ip=true", nil)
-		req.RemoteAddr = "198.51.100.30:12345"
-
-		rec := httptest.NewRecorder()
-		transparentProxy.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", rec.Code)
-		}
-
-		mu.Lock()
-		headers := receivedHeaders.Clone()
-		u := receivedURL
-		mu.Unlock()
-
-		if u != "/api" {
-			t.Errorf("expected /api without query string, got %q", u)
-		}
-		if headers.Get("X-Forwarded-For") != "" {
-			t.Errorf("expected no X-Forwarded-For, got %q", headers.Get("X-Forwarded-For"))
-		}
+	if u != rawTarget {
+		t.Errorf("expected URL query to be 100%% untouched %q, got %q", rawTarget, u)
 	}
 }
+
 
 

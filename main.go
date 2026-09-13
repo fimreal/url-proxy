@@ -516,10 +516,10 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 		return
 	}
 
-	// 5. Determine client IP forwarding preference (per-request override)
+	// 5. Determine client IP forwarding preference (default: hide IP, override via header)
 	hideClientIP := p.cfg.HideClientIP
 
-	// 5.1 Per-request override via HTTP headers:
+	// Per-request override via HTTP headers:
 	// X-Forward-Client-IP: true/1/false/0
 	// X-Hide-Client-IP: true/1/false/0
 	if val := r.Header.Get("X-Forward-Client-IP"); val != "" {
@@ -538,36 +538,6 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 		if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
 			hideClientIP = b
 		}
-	}
-
-	// 5.2 Per-request override via URL query parameters:
-	// ?proxy_forward_ip=true or ?proxy_hide_ip=true
-	q := targetURL.Query()
-	queryModified := false
-	for k := range q {
-		lowerK := strings.ToLower(k)
-		if lowerK == "proxy_forward_ip" || lowerK == "forward_client_ip" {
-			val := q.Get(k)
-			if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
-				hideClientIP = !b
-			} else {
-				hideClientIP = false
-			}
-			q.Del(k)
-			queryModified = true
-		} else if lowerK == "proxy_hide_ip" || lowerK == "hide_client_ip" {
-			val := q.Get(k)
-			if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
-				hideClientIP = b
-			} else {
-				hideClientIP = true
-			}
-			q.Del(k)
-			queryModified = true
-		}
-	}
-	if queryModified {
-		targetURL.RawQuery = q.Encode()
 	}
 
 	// 6. Construct upstream request
