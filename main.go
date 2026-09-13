@@ -24,6 +24,7 @@ type Config struct {
 	BlockPrivateIPs bool
 	MaxRedirects    int
 	BufferSizeKB    int
+	HideClientIP    bool
 }
 
 // LoadConfig initializes configuration from environment variables.
@@ -79,6 +80,17 @@ func LoadConfig() *Config {
 		}
 	}
 
+	hideClientIP := true
+	if val := os.Getenv("HIDE_CLIENT_IP"); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			hideClientIP = b
+		}
+	} else if val := os.Getenv("FORWARD_CLIENT_IP"); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			hideClientIP = !b
+		}
+	}
+
 	return &Config{
 		Port:            port,
 		AllowDomains:    allowDomains,
@@ -86,6 +98,7 @@ func LoadConfig() *Config {
 		BlockPrivateIPs: blockPrivateIPs,
 		MaxRedirects:    maxRedirects,
 		BufferSizeKB:    bufferSizeKB,
+		HideClientIP:    hideClientIP,
 	}
 }
 
@@ -245,6 +258,22 @@ var hopByHopHeaders = map[string]bool{
 	"Trailers":            true,
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
+}
+
+// Client IP identifying headers stripped when HideClientIP is enabled (high-anonymity proxy mode)
+var clientIPHeaders = map[string]bool{
+	http.CanonicalHeaderKey("X-Forwarded-For"):     true,
+	http.CanonicalHeaderKey("X-Forwarded-Proto"):   true,
+	http.CanonicalHeaderKey("X-Forwarded-Host"):    true,
+	http.CanonicalHeaderKey("X-Forwarded-Port"):    true,
+	http.CanonicalHeaderKey("X-Forwarded-Server"):  true,
+	http.CanonicalHeaderKey("X-Real-IP"):           true,
+	http.CanonicalHeaderKey("X-Client-IP"):         true,
+	http.CanonicalHeaderKey("CF-Connecting-IP"):    true,
+	http.CanonicalHeaderKey("True-Client-IP"):      true,
+	http.CanonicalHeaderKey("Fastly-Client-IP"):    true,
+	http.CanonicalHeaderKey("X-Cluster-Client-IP"): true,
+	http.CanonicalHeaderKey("Forwarded"):           true,
 }
 
 // NormalizeTargetURL extracts and repairs target URL from request paths.
@@ -420,6 +449,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"block_domains":    p.cfg.BlockDomains,
 			"block_private_ips": p.cfg.BlockPrivateIPs,
 			"max_redirects":     p.cfg.MaxRedirects,
+			"hide_client_ip":    p.cfg.HideClientIP,
 		})
 		return
 	}
@@ -485,9 +515,13 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 		return
 	}
 
-	// 6. Copy headers from client request (excluding hop-by-hop)
+	// 6. Copy headers from client request (excluding hop-by-hop and client IP identifying headers if HideClientIP is enabled)
 	for key, values := range r.Header {
-		if hopByHopHeaders[http.CanonicalHeaderKey(key)] {
+		canonicalKey := http.CanonicalHeaderKey(key)
+		if hopByHopHeaders[canonicalKey] {
+			continue
+		}
+		if p.cfg.HideClientIP && clientIPHeaders[canonicalKey] {
 			continue
 		}
 		for _, value := range values {
@@ -498,17 +532,19 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 	// Set target Host header and forwarding headers
 	upstreamReq.Host = targetURL.Host
 
-	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
-			clientIP = prior + ", " + clientIP
+	if !p.cfg.HideClientIP {
+		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err == nil {
+			if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
+				clientIP = prior + ", " + clientIP
+			}
+			upstreamReq.Header.Set("X-Forwarded-For", clientIP)
 		}
-		upstreamReq.Header.Set("X-Forwarded-For", clientIP)
-	}
-	if r.TLS != nil {
-		upstreamReq.Header.Set("X-Forwarded-Proto", "https")
-	} else {
-		upstreamReq.Header.Set("X-Forwarded-Proto", "http")
+		if r.TLS != nil {
+			upstreamReq.Header.Set("X-Forwarded-Proto", "https")
+		} else {
+			upstreamReq.Header.Set("X-Forwarded-Proto", "http")
+		}
 	}
 
 	// 7. Execute request via http.Client (follows redirects)

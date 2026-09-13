@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -389,6 +390,9 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.BufferSizeKB != 64 {
 		t.Errorf("expected buffer size 64, got %d", cfg.BufferSizeKB)
 	}
+	if !cfg.HideClientIP {
+		t.Errorf("expected HideClientIP to be true by default")
+	}
 }
 
 func TestNormalizeTargetURL_MoreCases(t *testing.T) {
@@ -602,3 +606,136 @@ func TestProxyServer_SSEStreamingChatCompletion(t *testing.T) {
 		t.Errorf("streamed body mismatch: got %q, expected %q", string(respBody), expectedContent)
 	}
 }
+
+func TestLoadConfig_HideClientIP(t *testing.T) {
+	// 1. Explicit HIDE_CLIENT_IP=false
+	t.Setenv("HIDE_CLIENT_IP", "false")
+	t.Setenv("FORWARD_CLIENT_IP", "")
+	cfg := LoadConfig()
+	if cfg.HideClientIP != false {
+		t.Errorf("expected HideClientIP false when HIDE_CLIENT_IP=false")
+	}
+
+	// 2. FORWARD_CLIENT_IP=true
+	t.Setenv("HIDE_CLIENT_IP", "")
+	t.Setenv("FORWARD_CLIENT_IP", "true")
+	cfg = LoadConfig()
+	if cfg.HideClientIP != false {
+		t.Errorf("expected HideClientIP false when FORWARD_CLIENT_IP=true")
+	}
+
+	// 3. HIDE_CLIENT_IP=true
+	t.Setenv("HIDE_CLIENT_IP", "true")
+	t.Setenv("FORWARD_CLIENT_IP", "true") // HIDE_CLIENT_IP takes precedence
+	cfg = LoadConfig()
+	if cfg.HideClientIP != true {
+		t.Errorf("expected HideClientIP true when HIDE_CLIENT_IP=true")
+	}
+}
+
+func TestProxyServer_HideClientIP(t *testing.T) {
+	var receivedHeaders http.Header
+	var mu sync.Mutex
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		receivedHeaders = r.Header.Clone()
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer upstreamServer.Close()
+
+	// Case 1: HideClientIP is true (High anonymity mode)
+	{
+		cfg := &Config{
+			BlockPrivateIPs: false,
+			MaxRedirects:    5,
+			BufferSizeKB:    32,
+			HideClientIP:    true,
+		}
+		proxy := NewProxyServer(cfg)
+
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		req.RemoteAddr = "198.51.100.10:54321"
+		req.Header.Set("Authorization", "Bearer test-secret")
+		req.Header.Set("X-Forwarded-For", "203.0.113.1")
+		req.Header.Set("X-Real-IP", "203.0.113.1")
+		req.Header.Set("X-Client-IP", "203.0.113.1")
+		req.Header.Set("CF-Connecting-IP", "203.0.113.1")
+		req.Header.Set("True-Client-IP", "203.0.113.1")
+		req.Header.Set("Forwarded", "for=203.0.113.1")
+		req.Header.Set("User-Agent", "my-client/1.0")
+
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", rec.Code)
+		}
+
+		mu.Lock()
+		headers := receivedHeaders.Clone()
+		mu.Unlock()
+
+		// Verify standard headers are preserved
+		if headers.Get("Authorization") != "Bearer test-secret" {
+			t.Errorf("expected Authorization to be preserved, got %q", headers.Get("Authorization"))
+		}
+		if headers.Get("User-Agent") != "my-client/1.0" {
+			t.Errorf("expected User-Agent to be preserved, got %q", headers.Get("User-Agent"))
+		}
+
+		// Verify all client identifying headers are stripped
+		disallowed := []string{
+			"X-Forwarded-For",
+			"X-Forwarded-Proto",
+			"X-Real-Ip",
+			"X-Client-Ip",
+			"Cf-Connecting-Ip",
+			"True-Client-Ip",
+			"Forwarded",
+		}
+		for _, h := range disallowed {
+			if val := headers.Get(h); val != "" {
+				t.Errorf("expected header %s to be stripped in HideClientIP mode, got %q", h, val)
+			}
+		}
+	}
+
+	// Case 2: HideClientIP is false (Transparent forwarding mode)
+	{
+		cfg := &Config{
+			BlockPrivateIPs: false,
+			MaxRedirects:    5,
+			BufferSizeKB:    32,
+			HideClientIP:    false,
+		}
+		proxy := NewProxyServer(cfg)
+
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		req.RemoteAddr = "198.51.100.10:54321"
+		req.Header.Set("X-Forwarded-For", "203.0.113.1")
+
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", rec.Code)
+		}
+
+		mu.Lock()
+		headers := receivedHeaders.Clone()
+		mu.Unlock()
+
+		// In transparent mode, X-Forwarded-For should append client IP
+		xff := headers.Get("X-Forwarded-For")
+		if !strings.Contains(xff, "198.51.100.10") {
+			t.Errorf("expected X-Forwarded-For to contain client remote addr, got %q", xff)
+		}
+		if headers.Get("X-Forwarded-Proto") == "" {
+			t.Errorf("expected X-Forwarded-Proto to be set in transparent mode")
+		}
+	}
+}
+
