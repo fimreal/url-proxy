@@ -276,6 +276,14 @@ var clientIPHeaders = map[string]bool{
 	http.CanonicalHeaderKey("Forwarded"):           true,
 }
 
+// Proxy control headers stripped from upstream requests to prevent leaking proxy instructions
+var proxyControlHeaders = map[string]bool{
+	http.CanonicalHeaderKey("X-Forward-Client-IP"): true,
+	http.CanonicalHeaderKey("X-Forward-IP"):        true,
+	http.CanonicalHeaderKey("X-Hide-Client-IP"):   true,
+	http.CanonicalHeaderKey("X-Hide-IP"):          true,
+}
+
 // NormalizeTargetURL extracts and repairs target URL from request paths.
 // It handles slash collapsing (e.g. /https:/domain.com), percent encoding (%3A, %2F),
 // and missing schemes.
@@ -508,20 +516,74 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 		return
 	}
 
-	// 5. Construct upstream request
+	// 5. Determine client IP forwarding preference (per-request override)
+	hideClientIP := p.cfg.HideClientIP
+
+	// 5.1 Per-request override via HTTP headers:
+	// X-Forward-Client-IP: true/1/false/0
+	// X-Hide-Client-IP: true/1/false/0
+	if val := r.Header.Get("X-Forward-Client-IP"); val != "" {
+		if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
+			hideClientIP = !b
+		}
+	} else if val := r.Header.Get("X-Forward-IP"); val != "" {
+		if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
+			hideClientIP = !b
+		}
+	} else if val := r.Header.Get("X-Hide-Client-IP"); val != "" {
+		if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
+			hideClientIP = b
+		}
+	} else if val := r.Header.Get("X-Hide-IP"); val != "" {
+		if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
+			hideClientIP = b
+		}
+	}
+
+	// 5.2 Per-request override via URL query parameters:
+	// ?proxy_forward_ip=true or ?proxy_hide_ip=true
+	q := targetURL.Query()
+	queryModified := false
+	for k := range q {
+		lowerK := strings.ToLower(k)
+		if lowerK == "proxy_forward_ip" || lowerK == "forward_client_ip" {
+			val := q.Get(k)
+			if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
+				hideClientIP = !b
+			} else {
+				hideClientIP = false
+			}
+			q.Del(k)
+			queryModified = true
+		} else if lowerK == "proxy_hide_ip" || lowerK == "hide_client_ip" {
+			val := q.Get(k)
+			if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
+				hideClientIP = b
+			} else {
+				hideClientIP = true
+			}
+			q.Del(k)
+			queryModified = true
+		}
+	}
+	if queryModified {
+		targetURL.RawQuery = q.Encode()
+	}
+
+	// 6. Construct upstream request
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create upstream request: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// 6. Copy headers from client request (excluding hop-by-hop and client IP identifying headers if HideClientIP is enabled)
+	// 7. Copy headers from client request (excluding hop-by-hop, proxy control headers, and client IP identifying headers if hideClientIP is enabled)
 	for key, values := range r.Header {
 		canonicalKey := http.CanonicalHeaderKey(key)
-		if hopByHopHeaders[canonicalKey] {
+		if hopByHopHeaders[canonicalKey] || proxyControlHeaders[canonicalKey] {
 			continue
 		}
-		if p.cfg.HideClientIP && clientIPHeaders[canonicalKey] {
+		if hideClientIP && clientIPHeaders[canonicalKey] {
 			continue
 		}
 		for _, value := range values {
@@ -532,13 +594,20 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 	// Set target Host header and forwarding headers
 	upstreamReq.Host = targetURL.Host
 
-	if !p.cfg.HideClientIP {
-		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err == nil {
+	if !hideClientIP {
+		remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			remoteIP = r.RemoteAddr
+		}
+		if remoteIP != "" {
+			xff := remoteIP
 			if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
-				clientIP = prior + ", " + clientIP
+				xff = prior + ", " + remoteIP
 			}
-			upstreamReq.Header.Set("X-Forwarded-For", clientIP)
+			upstreamReq.Header.Set("X-Forwarded-For", xff)
+			if upstreamReq.Header.Get("X-Real-IP") == "" {
+				upstreamReq.Header.Set("X-Real-IP", remoteIP)
+			}
 		}
 		if r.TLS != nil {
 			upstreamReq.Header.Set("X-Forwarded-Proto", "https")
