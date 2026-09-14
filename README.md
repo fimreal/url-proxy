@@ -255,15 +255,29 @@ services:
 
 ---
 
-### CI/CD 自动化构建（兼容 Gitea Actions 与 GitHub Actions）
+### CI/CD 自动化构建与 Release 发布（兼容 GitHub Actions 与 Gitea Actions）
 
-项目已在 `.gitea/workflows/docker.yaml` 与 `.github/workflows/docker.yaml` 中配置了跨平台 CI 自动化构建流水线：
-- **触发时机**：代码 Push 至 `main` 分支或推送版本 Tag（如 `v1.0.0`），或在 Gitea 界面手动触发（`workflow_dispatch`）。
+项目配置了完整的自动化流水线，兼顾容器化与轻量二进制分发场景：
+
+#### 1. Docker 镜像自动化发布（`.github/workflows/docker.yaml` 与 `.gitea/workflows/docker.yaml`）
+- **触发时机**：代码 Push 至 `main` 分支或推送版本 Tag（如 `v1.0.0`），或在界面手动触发（`workflow_dispatch`）。
 - **多平台矩阵**：基于 Docker Buildx 原生交叉编译输出 `linux/amd64` (x86_64) 与 `linux/arm64` 镜像。
-- **凭据要求**：在 Gitea 仓库的 `Settings` -> `Actions` -> `Secrets` 中配置：
-  - `DOCKER_USERNAME`: Docker Hub 用户名（默认 `epurs`）
+- **凭据要求**：在 GitHub / Gitea 仓库的 `Settings` -> `Actions` -> `Secrets` 中配置：
+  - `DOCKER_USERNAME`: Docker Hub 用户名（默认兜底为 `epurs`）
   - `DOCKER_PASSWORD`: Docker Hub 访问 Token 或密码
-- **自动打标**：推送至 `main` 自动打 `latest` 标签，发布 Tag 自动打语义化版本标签。
+- **健壮性降级**：若未配置 `DOCKER_PASSWORD`，流水线自动降级为多架构编译校验（`push: false`）并给出 Warning 提示，避免流程暴红。
+
+#### 2. 多平台独立二进制 Release 自动化发布（`.github/workflows/release.yaml` 与 `.gitea/workflows/release.yaml`）
+- **触发时机**：推送版本 Tag（如 `git push origin v1.0.0`），或在 Actions 界面手动触发（`workflow_dispatch` 输入 Tag 名称）。
+- **跨平台全架构覆盖**：
+  - **Linux**：`linux/amd64`, `linux/arm64`, `linux/arm` (ARMv7)
+  - **macOS (Darwin)**：`darwin/amd64` (Intel Mac), `darwin/arm64` (Apple Silicon M系列芯片)
+  - **Windows**：`windows/amd64.exe`, `windows/arm64.exe`
+- **自动归档与校验**：各架构分别打包为 `.tar.gz` 或 `.zip`，内置 `README.md`，并自动生成包含全量哈希的 `checksums.txt`，自动发布至 GitHub Releases。
+- **本地一键打包**：开发者在本地任意环境亦可直接执行脚本构建全量发布包：
+  ```bash
+  ./scripts/build-release.sh v1.0.0
+  ```
 
 ---
 

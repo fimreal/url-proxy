@@ -19,6 +19,12 @@ import (
 	"time"
 )
 
+var (
+	Version   = "dev"
+	CommitSHA = "none"
+	BuildDate = "unknown"
+)
+
 // Config stores the runtime configuration loaded from environment variables and CLI flags.
 type Config struct {
 	Port            string
@@ -598,6 +604,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":            "ok",
+			"version":           Version,
 			"allow_domains":    p.cfg.AllowDomains,
 			"block_domains":    p.cfg.BlockDomains,
 			"block_private_ips": p.cfg.BlockPrivateIPs,
@@ -1011,17 +1018,23 @@ UTILITY ENDPOINTS:
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = "8080"
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-version", "--version", "-v":
+			fmt.Printf("url-proxy %s (commit: %s, built: %s)\n", Version, CommitSHA, BuildDate)
+			os.Exit(0)
+		case "-healthcheck":
+			port := os.Getenv("PORT")
+			if port == "" {
+				port = "8080"
+			}
+			port = strings.TrimPrefix(port, ":")
+			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%s/healthz", port))
+			if err != nil || resp.StatusCode != http.StatusOK {
+				os.Exit(1)
+			}
+			os.Exit(0)
 		}
-		port = strings.TrimPrefix(port, ":")
-		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%s/healthz", port))
-		if err != nil || resp.StatusCode != http.StatusOK {
-			os.Exit(1)
-		}
-		os.Exit(0)
 	}
 
 	cfg := LoadConfig(os.Args[1:]...)
