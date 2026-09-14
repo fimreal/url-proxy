@@ -399,6 +399,18 @@ curl -s http://localhost:8080/healthz | jq .
 }
 ```
 
+### 7. 终端命令行快速帮助手册（curl /help）
+
+无需查阅网页文档，任何时候在终端执行 `curl /help`（或使用 curl 直接访问根路径 `/`）即可即时输出完整的英文格式化使用指南与标头说明：
+
+```bash
+curl http://localhost:8080/help
+# 或直接
+curl http://localhost:8080/
+```
+
+终端将即时打印格式化好的 USAGE、认证 Header（Basic/Bearer/Proxy-Authorization/X-Proxy-Token）、高匿与真实 IP 控制 Header 等所有选项及示例。
+
 ---
 
 ## 测试覆盖与质量报告
@@ -418,4 +430,5 @@ go test -v -race -coverprofile=coverage.out .
 - [x] **流式与断点续传**：大响应流式透传无内存缓存、HTTP 206 Partial Content 及 Content-Range 透传。
 - [x] **高匿模式与客户端自主选择**：默认隐藏客户端 IP、`X-Forward-Client-IP` 按需透传、Query 参数无损不侵入。
 - [x] **访问认证体系**：Basic Auth 环境变量与 CLI 参数加载、Bearer Token 多令牌比对、常量时间对比防计时攻击、上游目标凭据解耦透传、未授权 401 阻断与 WWW-Authenticate 标头、`/healthz` 探针免密放行。
+- [x] **命令行即时手册**：`/help` 纯文本格式化输出、CLI（curl/wget/httpie）智能探测、未认证访问豁免保障。
 - [x] **健康检查与自检**：`-healthcheck` 原生自检旗标测试、Web 端图形化使用说明首页。

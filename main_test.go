@@ -1165,6 +1165,158 @@ func TestProxyServer_HealthCheck_NoAuthRequired(t *testing.T) {
 	}
 }
 
+func TestProxyServer_HelpEndpoint(t *testing.T) {
+	cfg := &Config{
+		BlockPrivateIPs: false,
+		MaxRedirects:    5,
+		BufferSizeKB:    32,
+	}
+	proxy := NewProxyServer(cfg)
+
+	// 1. GET /help
+	req := httptest.NewRequest("GET", "/help", nil)
+	req.Host = "10.0.0.10:18080"
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /help, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("expected text/plain; charset=utf-8, got %q", ct)
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		"Universal URL Proxy (url-proxy)",
+		"USAGE:",
+		"Proxy-Authorization",
+		"X-Proxy-Token",
+		"X-Forward-Client-IP",
+		"10.0.0.10:18080",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("expected /help body to contain %q", expected)
+		}
+	}
+
+	// 2. GET /help/
+	req2 := httptest.NewRequest("GET", "/help/", nil)
+	rec2 := httptest.NewRecorder()
+	proxy.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /help/, got %d", rec2.Code)
+	}
+
+	// 3. GET /?help
+	req3 := httptest.NewRequest("GET", "/?help", nil)
+	rec3 := httptest.NewRecorder()
+	proxy.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /?help, got %d", rec3.Code)
+	}
+}
+
+func TestProxyServer_HelpEndpoint_NoAuthRequired(t *testing.T) {
+	// Help page must be accessible without credentials even when authentication is turned on
+	cfg := &Config{
+		BlockPrivateIPs: false,
+		MaxRedirects:    5,
+		BufferSizeKB:    32,
+		BasicAuthUser:   "admin",
+		BasicAuthPass:   "pass123",
+		BearerTokens:    []string{"token-xyz"},
+	}
+	proxy := NewProxyServer(cfg)
+
+	req := httptest.NewRequest("GET", "/help", nil)
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /help without credentials, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Universal URL Proxy") {
+		t.Errorf("expected /help content in unauthenticated response")
+	}
+}
+
+func TestProxyServer_RootEndpoint_CommandLineVsBrowser(t *testing.T) {
+	cfg := &Config{
+		BlockPrivateIPs: false,
+		MaxRedirects:    5,
+		BufferSizeKB:    32,
+	}
+	proxy := NewProxyServer(cfg)
+
+	// 1. curl client requesting "/" should get plain text help
+	reqCurl := httptest.NewRequest("GET", "/", nil)
+	reqCurl.Header.Set("User-Agent", "curl/7.81.0")
+	recCurl := httptest.NewRecorder()
+	proxy.ServeHTTP(recCurl, reqCurl)
+
+	if recCurl.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for curl /, got %d", recCurl.Code)
+	}
+	if ct := recCurl.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("expected text/plain for curl, got %q", ct)
+	}
+	if !strings.Contains(recCurl.Body.String(), "Universal URL Proxy") {
+		t.Errorf("expected help text for curl /")
+	}
+
+	// 2. wget client requesting "/" should get plain text help
+	reqWget := httptest.NewRequest("GET", "/", nil)
+	reqWget.Header.Set("User-Agent", "Wget/1.21.2")
+	recWget := httptest.NewRecorder()
+	proxy.ServeHTTP(recWget, reqWget)
+	if recWget.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for wget /, got %d", recWget.Code)
+	}
+	if ct := recWget.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("expected text/plain for wget, got %q", ct)
+	}
+
+	// 3. Browser requesting "/" should get HTML
+	reqBrowser := httptest.NewRequest("GET", "/", nil)
+	reqBrowser.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+	recBrowser := httptest.NewRecorder()
+	proxy.ServeHTTP(recBrowser, reqBrowser)
+
+	if recBrowser.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for browser /, got %d", recBrowser.Code)
+	}
+	if ct := recBrowser.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Errorf("expected text/html for browser, got %q", ct)
+	}
+	if !strings.Contains(recBrowser.Body.String(), "<!DOCTYPE html>") {
+		t.Errorf("expected HTML content for browser /")
+	}
+}
+
+func TestIsCommandLineClient(t *testing.T) {
+	tests := []struct {
+		ua       string
+		expected bool
+	}{
+		{"curl/7.81.0", true},
+		{"curl/8.4.0", true},
+		{"Wget/1.21.2", true},
+		{"wget/1.20", true},
+		{"HTTPie/3.2.1", true},
+		{"httpie/2.4.0", true},
+		{"Mozilla/5.0 (Windows NT 10.0; Win64; x64)", false},
+		{"Go-http-client/1.1", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		got := isCommandLineClient(tt.ua)
+		if got != tt.expected {
+			t.Errorf("isCommandLineClient(%q) = %v; want %v", tt.ua, got, tt.expected)
+		}
+	}
+}
+
 
 
 

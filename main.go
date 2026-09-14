@@ -608,14 +608,23 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Authentication verification (Basic Auth / Bearer Token)
-	if !p.authenticate(r) {
-		p.rejectUnauthorized(w)
+	// 2. Help manual endpoint (always unauthenticated plain-text guide for curl / CLI)
+	if r.URL.Path == "/help" || r.URL.Path == "/help/" || r.URL.Query().Has("help") {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(HelpText(r.Host)))
 		return
 	}
 
-	// 3. Root usage page
+	// 3. Root usage page (for curl/wget, returns plain text help; for browsers, returns HTML)
 	if r.URL.Path == "/" || r.URL.Path == "" {
+		if isCommandLineClient(r.UserAgent()) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(HelpText(r.Host)))
+			return
+		}
+
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `<!DOCTYPE html>
@@ -640,18 +649,32 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 </div>
 
 <div class="card">
+<h3>命令行手册 (curl /help)</h3>
+<p>在终端直接执行 curl 命令即可查看包含所有认证与控制标头的英文帮助手册：</p>
+<pre>curl http://%s/help</pre>
+</div>
+
+<div class="card">
 <h3>核心特性</h3>
 <ul>
 <li><strong>路径容错：</strong>自动识别并修复反向代理（如 Nginx）合并后的 <code>/https:/domain</code> 路径及 URL 编码。</li>
 <li><strong>流式转发：</strong>流式传输大文件（如 Releases / Binaries），零内存缓冲，杜绝 OOM。</li>
 <li><strong>断点续传：</strong>完整透传 <code>Range</code> 请求头与 <code>206 Partial Content</code> 响应头。</li>
+<li><strong>安全认证：</strong>支持 Basic Auth 与 Bearer Auth，通过 <code>Proxy-Authorization</code> 或 <code>X-Proxy-Token</code> 鉴权并透传上游 Token。</li>
+<li><strong>高匿代理：</strong>默认隐藏客户端 IP，支持 <code>X-Forward-Client-IP</code> 动态控制。</li>
 <li><strong>安全防护：</strong>支持 <code>ALLOW_DOMAINS</code> / <code>BLOCK_DOMAINS</code> 白黑名单，默认防范内网 SSRF 与 DNS 重绑定。</li>
 </ul>
 </div>
 
-<p><small>Health Check: <a href="/healthz">/healthz</a></small></p>
+<p><small>Health Check: <a href="/healthz">/healthz</a> | Text Help: <a href="/help">/help</a></small></p>
 </body>
-</html>`, r.Host)
+</html>`, r.Host, r.Host)
+		return
+	}
+
+	// 4. Authentication verification (Basic Auth / Bearer Token)
+	if !p.authenticate(r) {
+		p.rejectUnauthorized(w)
 		return
 	}
 
@@ -899,8 +922,92 @@ func (p *ProxyServer) rejectUnauthorized(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusUnauthorized)
 	json.NewEncoder(w).Encode(map[string]string{
 		"error":   "unauthorized",
-		"message": "Authentication required. Please provide credentials via Basic Auth (Authorization / Proxy-Authorization) or Bearer Token (Authorization / Proxy-Authorization / X-Proxy-Token).",
+		"message": "Authentication required. See /help for supported headers and usage examples.",
 	})
+}
+
+// isCommandLineClient returns true if the User-Agent indicates a CLI tool like curl, wget, or httpie.
+func isCommandLineClient(userAgent string) bool {
+	ua := strings.ToLower(userAgent)
+	return strings.HasPrefix(ua, "curl") ||
+		strings.HasPrefix(ua, "wget") ||
+		strings.HasPrefix(ua, "httpie")
+}
+
+// HelpText returns a formatted plain-text user manual for terminal/CLI users.
+func HelpText(host string) string {
+	if host == "" {
+		host = "10.0.0.10:18080"
+	}
+	return fmt.Sprintf(`===============================================================================
+                       Universal URL Proxy (url-proxy)
+===============================================================================
+
+USAGE:
+  curl [OPTIONS] http://%s/<target-url>
+
+BASIC EXAMPLES:
+  # 1. Download a GitHub Release asset or raw file
+  curl -LO http://%s/https://github.com/torvalds/linux/archive/refs/tags/v6.0.tar.gz
+
+  # 2. Resumable download / Range request (HTTP 206 Partial Content)
+  curl -H "Range: bytes=0-1023" http://%s/https://example.com/largefile.zip
+
+  # 3. Model API forwarding (OpenAI / Claude / Groq streaming or non-streaming)
+  curl -X POST http://%s/https://api.openai.com/v1/chat/completions \
+    -H "Authorization: Bearer sk-your-api-key" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
+
+-------------------------------------------------------------------------------
+AUTHENTICATION HEADERS (When Basic Auth or Bearer Token is enabled):
+-------------------------------------------------------------------------------
+  If the proxy server requires authentication, pass credentials using any of:
+
+  Option A: RFC 7235 Standard Proxy Header (Recommended for upstream auth separation)
+    - Basic Auth:
+        curl -H "Proxy-Authorization: Basic <base64(username:password)>" ...
+    - Bearer Token:
+        curl -H "Proxy-Authorization: Bearer <proxy-token>" ...
+    * Benefit: The proxy consumes Proxy-Authorization. Any target
+      "Authorization" header (e.g. sk-...) is 100%% preserved for the upstream!
+
+  Option B: Dedicated Proxy Token Header (Recommended for LLM APIs)
+    - Token:
+        curl -H "X-Proxy-Token: <proxy-token>" ...
+        curl -H "X-Proxy-Auth:  <proxy-token>" ...
+    * Benefit: Dedicated header eliminates collision with upstream Authorization.
+
+  Option C: Standard Authorization Header (Single-tier proxy usage)
+    - Basic Auth:
+        curl -u user:pass http://%s/<target-url>
+    - Bearer Token:
+        curl -H "Authorization: Bearer <proxy-token>" http://%s/<target-url>
+    * Security: If used to authenticate to the proxy alone, this header is
+      automatically stripped before forwarding to prevent credential leakage.
+
+-------------------------------------------------------------------------------
+CLIENT IP & PRIVACY HEADERS (High-Anonymity Mode):
+-------------------------------------------------------------------------------
+  The proxy operates in high-anonymity mode by default (HIDE_CLIENT_IP=true).
+  Identifying headers (X-Forwarded-For, X-Real-IP, etc.) are stripped so the
+  target server only sees the proxy's IP.
+
+  Per-request header controls:
+  - Forward client real IP to target:
+      curl -H "X-Forward-Client-IP: true" http://%s/<target-url>
+
+  - Hide client real IP (default):
+      curl -H "X-Hide-Client-IP: true" http://%s/<target-url>
+
+-------------------------------------------------------------------------------
+UTILITY ENDPOINTS:
+-------------------------------------------------------------------------------
+  GET /help     - Plain-text usage manual (this help page)
+  GET /healthz  - Health check & runtime status (JSON, always unauthenticated)
+
+===============================================================================
+`, host, host, host, host, host, host, host, host)
 }
 
 func main() {
