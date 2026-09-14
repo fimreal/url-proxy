@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -16,7 +19,7 @@ import (
 	"time"
 )
 
-// Config stores the runtime configuration loaded from environment variables.
+// Config stores the runtime configuration loaded from environment variables and CLI flags.
 type Config struct {
 	Port            string
 	AllowDomains    []string
@@ -25,10 +28,20 @@ type Config struct {
 	MaxRedirects    int
 	BufferSizeKB    int
 	HideClientIP    bool
+
+	// Authentication configuration
+	BasicAuthUser string
+	BasicAuthPass string
+	BearerTokens  []string
 }
 
-// LoadConfig initializes configuration from environment variables.
-func LoadConfig() *Config {
+// AuthEnabled returns true if Basic Auth or Bearer Auth is configured.
+func (c *Config) AuthEnabled() bool {
+	return (c.BasicAuthUser != "" && c.BasicAuthPass != "") || len(c.BearerTokens) > 0
+}
+
+// LoadConfig initializes configuration from environment variables and optional CLI flags.
+func LoadConfig(args ...string) *Config {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -91,6 +104,132 @@ func LoadConfig() *Config {
 		}
 	}
 
+	// Basic Auth from env
+	basicAuthUser := os.Getenv("BASIC_AUTH_USER")
+	basicAuthPass := os.Getenv("BASIC_AUTH_PASS")
+	if basicAuthPass == "" {
+		basicAuthPass = os.Getenv("BASIC_AUTH_PASSWORD")
+	}
+	if val := os.Getenv("BASIC_AUTH"); val != "" {
+		if parts := strings.SplitN(val, ":", 2); len(parts) == 2 {
+			basicAuthUser = strings.TrimSpace(parts[0])
+			basicAuthPass = strings.TrimSpace(parts[1])
+		}
+	}
+
+	// Bearer Token(s) from env
+	var bearerTokens []string
+	bearerTokensStr := os.Getenv("BEARER_TOKEN")
+	if bearerTokensStr == "" {
+		bearerTokensStr = os.Getenv("BEARER_AUTH")
+	}
+	if bearerTokensStr == "" {
+		bearerTokensStr = os.Getenv("AUTH_TOKEN")
+	}
+	if bearerTokensStr == "" {
+		bearerTokensStr = os.Getenv("TOKEN")
+	}
+	if strings.TrimSpace(bearerTokensStr) != "" {
+		for _, t := range strings.Split(bearerTokensStr, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				bearerTokens = append(bearerTokens, t)
+			}
+		}
+	}
+
+	// CLI flags override / augment
+	if len(args) > 0 {
+		fs := flag.NewFlagSet("url-proxy", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+
+		portFlag := fs.String("port", "", "Service listen port (e.g. 8080 or :8080)")
+		allowDomainsFlag := fs.String("allow-domains", "", "Allowed domains comma-separated")
+		blockDomainsFlag := fs.String("block-domains", "", "Blocked domains comma-separated")
+		blockPrivateIPsFlag := fs.String("block-private-ips", "", "Block private IPs (true/false)")
+		maxRedirectsFlag := fs.Int("max-redirects", -1, "Maximum redirects to follow")
+		bufferSizeKBFlag := fs.Int("buffer-size-kb", -1, "Buffer size in KB")
+		hideClientIPFlag := fs.String("hide-client-ip", "", "Hide client real IP (true/false)")
+		basicAuthFlag := fs.String("basic-auth", "", "Basic auth credentials in user:password format")
+		basicUserFlag := fs.String("basic-user", "", "Basic auth username")
+		basicPassFlag := fs.String("basic-pass", "", "Basic auth password")
+		bearerTokenFlag := fs.String("bearer-token", "", "Bearer token(s), comma-separated")
+		bearerAuthFlag := fs.String("bearer-auth", "", "Bearer token(s), comma-separated")
+		tokenFlag := fs.String("token", "", "Bearer token(s), comma-separated")
+
+		_ = fs.Parse(args)
+
+		if *portFlag != "" {
+			p := *portFlag
+			if !strings.HasPrefix(p, ":") {
+				p = ":" + p
+			}
+			port = p
+		}
+		if *allowDomainsFlag != "" {
+			allowDomains = nil
+			for _, d := range strings.Split(*allowDomainsFlag, ",") {
+				d = strings.TrimSpace(d)
+				if d != "" {
+					allowDomains = append(allowDomains, strings.ToLower(d))
+				}
+			}
+		}
+		if *blockDomainsFlag != "" {
+			blockDomains = nil
+			for _, d := range strings.Split(*blockDomainsFlag, ",") {
+				d = strings.TrimSpace(d)
+				if d != "" {
+					blockDomains = append(blockDomains, strings.ToLower(d))
+				}
+			}
+		}
+		if *blockPrivateIPsFlag != "" {
+			if b, err := strconv.ParseBool(*blockPrivateIPsFlag); err == nil {
+				blockPrivateIPs = b
+			}
+		}
+		if *maxRedirectsFlag >= 0 {
+			maxRedirects = *maxRedirectsFlag
+		}
+		if *bufferSizeKBFlag > 0 {
+			bufferSizeKB = *bufferSizeKBFlag
+		}
+		if *hideClientIPFlag != "" {
+			if b, err := strconv.ParseBool(*hideClientIPFlag); err == nil {
+				hideClientIP = b
+			}
+		}
+		if *basicAuthFlag != "" {
+			if parts := strings.SplitN(*basicAuthFlag, ":", 2); len(parts) == 2 {
+				basicAuthUser = strings.TrimSpace(parts[0])
+				basicAuthPass = strings.TrimSpace(parts[1])
+			}
+		}
+		if *basicUserFlag != "" {
+			basicAuthUser = strings.TrimSpace(*basicUserFlag)
+		}
+		if *basicPassFlag != "" {
+			basicAuthPass = strings.TrimSpace(*basicPassFlag)
+		}
+		btStr := *bearerTokenFlag
+		if btStr == "" {
+			btStr = *bearerAuthFlag
+		}
+		if btStr == "" {
+			btStr = *tokenFlag
+		}
+		if btStr != "" {
+			bearerTokens = nil
+			for _, t := range strings.Split(btStr, ",") {
+				t = strings.TrimSpace(t)
+				if t != "" {
+					bearerTokens = append(bearerTokens, t)
+				}
+			}
+		}
+	}
+
 	return &Config{
 		Port:            port,
 		AllowDomains:    allowDomains,
@@ -99,6 +238,9 @@ func LoadConfig() *Config {
 		MaxRedirects:    maxRedirects,
 		BufferSizeKB:    bufferSizeKB,
 		HideClientIP:    hideClientIP,
+		BasicAuthUser:   basicAuthUser,
+		BasicAuthPass:   basicAuthPass,
+		BearerTokens:    bearerTokens,
 	}
 }
 
@@ -282,6 +424,9 @@ var proxyControlHeaders = map[string]bool{
 	http.CanonicalHeaderKey("X-Forward-IP"):        true,
 	http.CanonicalHeaderKey("X-Hide-Client-IP"):   true,
 	http.CanonicalHeaderKey("X-Hide-IP"):          true,
+	http.CanonicalHeaderKey("X-Proxy-Token"):       true,
+	http.CanonicalHeaderKey("X-Proxy-Auth"):        true,
+	http.CanonicalHeaderKey("X-Token"):             true,
 }
 
 // NormalizeTargetURL extracts and repairs target URL from request paths.
@@ -447,7 +592,7 @@ func NewProxyServer(cfg *Config) *ProxyServer {
 
 // ServeHTTP handles incoming requests, validates security, and streams responses.
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 1. Health check endpoint
+	// 1. Health check endpoint (always unauthenticated for orchestrator liveness/readiness probes)
 	if r.URL.Path == "/healthz" || r.URL.Path == "/health" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -458,11 +603,18 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"block_private_ips": p.cfg.BlockPrivateIPs,
 			"max_redirects":     p.cfg.MaxRedirects,
 			"hide_client_ip":    p.cfg.HideClientIP,
+			"auth_enabled":      p.cfg.AuthEnabled(),
 		})
 		return
 	}
 
-	// 2. Root usage page
+	// 2. Authentication verification (Basic Auth / Bearer Token)
+	if !p.authenticate(r) {
+		p.rejectUnauthorized(w)
+		return
+	}
+
+	// 3. Root usage page
 	if r.URL.Path == "/" || r.URL.Path == "" {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
@@ -548,12 +700,30 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 	}
 
 	// 7. Copy headers from client request (excluding hop-by-hop, proxy control headers, and client IP identifying headers if hideClientIP is enabled)
+	// If Authorization was used to authenticate to the proxy itself (and no dedicated Proxy-Authorization/X-Proxy-Token was used),
+	// strip Authorization so we don't leak the proxy's credentials to the upstream server!
+	consumedAuthHeader := false
+	if p.cfg.AuthEnabled() {
+		if auth := r.Header.Get("Authorization"); auth != "" && p.checkAuthHeader(auth) {
+			hasDedicatedProxyAuth := r.Header.Get("Proxy-Authorization") != "" ||
+				r.Header.Get("X-Proxy-Token") != "" ||
+				r.Header.Get("X-Proxy-Auth") != "" ||
+				r.Header.Get("X-Token") != ""
+			if !hasDedicatedProxyAuth {
+				consumedAuthHeader = true
+			}
+		}
+	}
+
 	for key, values := range r.Header {
 		canonicalKey := http.CanonicalHeaderKey(key)
 		if hopByHopHeaders[canonicalKey] || proxyControlHeaders[canonicalKey] {
 			continue
 		}
 		if hideClientIP && clientIPHeaders[canonicalKey] {
+			continue
+		}
+		if consumedAuthHeader && canonicalKey == "Authorization" {
 			continue
 		}
 		for _, value := range values {
@@ -632,6 +802,107 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 	}
 }
 
+// authenticate checks if the request has valid credentials matching configured Basic Auth or Bearer tokens.
+func (p *ProxyServer) authenticate(r *http.Request) bool {
+	if !p.cfg.AuthEnabled() {
+		return true
+	}
+
+	// 1. Check Proxy-Authorization header (RFC 7235 / RFC 2617 for proxies)
+	if proxyAuth := r.Header.Get("Proxy-Authorization"); proxyAuth != "" {
+		if p.checkAuthHeader(proxyAuth) {
+			return true
+		}
+	}
+
+	// 2. Check dedicated X-Proxy-Token / X-Proxy-Auth / X-Token headers
+	// (allows clients to authenticate to proxy while reserving Authorization for upstream targets)
+	if token := r.Header.Get("X-Proxy-Token"); token != "" {
+		if p.checkBearerToken(token) {
+			return true
+		}
+	}
+	if token := r.Header.Get("X-Proxy-Auth"); token != "" {
+		if p.checkAuthHeader(token) || p.checkBearerToken(token) {
+			return true
+		}
+	}
+	if token := r.Header.Get("X-Token"); token != "" {
+		if p.checkBearerToken(token) {
+			return true
+		}
+	}
+
+	// 3. Check standard Authorization header
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if p.checkAuthHeader(auth) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (p *ProxyServer) checkAuthHeader(auth string) bool {
+	parts := strings.SplitN(strings.TrimSpace(auth), " ", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	authType := strings.ToLower(parts[0])
+	authPayload := strings.TrimSpace(parts[1])
+
+	switch authType {
+	case "basic":
+		if p.cfg.BasicAuthUser == "" || p.cfg.BasicAuthPass == "" {
+			return false
+		}
+		decoded, err := base64.StdEncoding.DecodeString(authPayload)
+		if err != nil {
+			return false
+		}
+		cred := strings.SplitN(string(decoded), ":", 2)
+		if len(cred) != 2 {
+			return false
+		}
+		userMatch := subtle.ConstantTimeCompare([]byte(cred[0]), []byte(p.cfg.BasicAuthUser)) == 1
+		passMatch := subtle.ConstantTimeCompare([]byte(cred[1]), []byte(p.cfg.BasicAuthPass)) == 1
+		return userMatch && passMatch
+
+	case "bearer":
+		return p.checkBearerToken(authPayload)
+	}
+
+	return false
+}
+
+func (p *ProxyServer) checkBearerToken(token string) bool {
+	token = strings.TrimSpace(token)
+	if token == "" || len(p.cfg.BearerTokens) == 0 {
+		return false
+	}
+	for _, expected := range p.cfg.BearerTokens {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *ProxyServer) rejectUnauthorized(w http.ResponseWriter) {
+	if p.cfg.BasicAuthUser != "" && p.cfg.BasicAuthPass != "" {
+		w.Header().Add("WWW-Authenticate", `Basic realm="url-proxy"`)
+	}
+	if len(p.cfg.BearerTokens) > 0 {
+		w.Header().Add("WWW-Authenticate", `Bearer realm="url-proxy"`)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	json.NewEncoder(w).Encode(map[string]string{
+		"error":   "unauthorized",
+		"message": "Authentication required. Please provide credentials via Basic Auth (Authorization / Proxy-Authorization) or Bearer Token (Authorization / Proxy-Authorization / X-Proxy-Token).",
+	})
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
 		port := os.Getenv("PORT")
@@ -646,12 +917,12 @@ func main() {
 		os.Exit(0)
 	}
 
-	cfg := LoadConfig()
+	cfg := LoadConfig(os.Args[1:]...)
 	server := NewProxyServer(cfg)
 
 	log.Printf("Starting Universal URL Proxy on %s ...", cfg.Port)
-	log.Printf("Config: AllowDomains=%v, BlockDomains=%v, BlockPrivateIPs=%v, MaxRedirects=%d, BufferSizeKB=%d",
-		cfg.AllowDomains, cfg.BlockDomains, cfg.BlockPrivateIPs, cfg.MaxRedirects, cfg.BufferSizeKB)
+	log.Printf("Config: AllowDomains=%v, BlockDomains=%v, BlockPrivateIPs=%v, MaxRedirects=%d, BufferSizeKB=%d, HideClientIP=%v, AuthEnabled=%v",
+		cfg.AllowDomains, cfg.BlockDomains, cfg.BlockPrivateIPs, cfg.MaxRedirects, cfg.BufferSizeKB, cfg.HideClientIP, cfg.AuthEnabled())
 
 	httpServer := &http.Server{
 		Addr:         cfg.Port,

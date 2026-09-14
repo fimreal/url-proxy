@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -881,6 +883,288 @@ func TestProxyServer_QueryPreservedUntouched(t *testing.T) {
 		t.Errorf("expected URL query to be 100%% untouched %q, got %q", rawTarget, u)
 	}
 }
+
+func TestLoadConfig_Auth(t *testing.T) {
+	// Case 1: BASIC_AUTH env
+	t.Setenv("BASIC_AUTH", "myuser:mypass123")
+	t.Setenv("BEARER_TOKEN", "")
+	cfg := LoadConfig()
+	if cfg.BasicAuthUser != "myuser" || cfg.BasicAuthPass != "mypass123" {
+		t.Errorf("expected basic auth user myuser pass mypass123, got %s:%s", cfg.BasicAuthUser, cfg.BasicAuthPass)
+	}
+	if !cfg.AuthEnabled() {
+		t.Errorf("expected AuthEnabled to be true")
+	}
+
+	// Case 2: BASIC_AUTH_USER and BASIC_AUTH_PASS env
+	t.Setenv("BASIC_AUTH", "")
+	t.Setenv("BASIC_AUTH_USER", "admin")
+	t.Setenv("BASIC_AUTH_PASS", "secret888")
+	cfg = LoadConfig()
+	if cfg.BasicAuthUser != "admin" || cfg.BasicAuthPass != "secret888" {
+		t.Errorf("expected basic auth admin:secret888, got %s:%s", cfg.BasicAuthUser, cfg.BasicAuthPass)
+	}
+
+	// Case 3: BEARER_TOKEN env (comma-separated)
+	t.Setenv("BASIC_AUTH_USER", "")
+	t.Setenv("BASIC_AUTH_PASS", "")
+	t.Setenv("BEARER_TOKEN", "token1, token2, token3")
+	cfg = LoadConfig()
+	if len(cfg.BearerTokens) != 3 || cfg.BearerTokens[0] != "token1" || cfg.BearerTokens[1] != "token2" || cfg.BearerTokens[2] != "token3" {
+		t.Errorf("unexpected bearer tokens: %v", cfg.BearerTokens)
+	}
+	if !cfg.AuthEnabled() {
+		t.Errorf("expected AuthEnabled to be true")
+	}
+
+	// Case 4: CLI flags override
+	t.Setenv("BASIC_AUTH", "")
+	t.Setenv("BEARER_TOKEN", "")
+	cfg = LoadConfig("-basic-auth", "flaguser:flagpass", "-token", "tokA,tokB")
+	if cfg.BasicAuthUser != "flaguser" || cfg.BasicAuthPass != "flagpass" {
+		t.Errorf("expected flaguser:flagpass, got %s:%s", cfg.BasicAuthUser, cfg.BasicAuthPass)
+	}
+	if len(cfg.BearerTokens) != 2 || cfg.BearerTokens[0] != "tokA" || cfg.BearerTokens[1] != "tokB" {
+		t.Errorf("expected [tokA tokB], got %v", cfg.BearerTokens)
+	}
+	if !cfg.AuthEnabled() {
+		t.Errorf("expected AuthEnabled to be true")
+	}
+}
+
+func TestProxyServer_BasicAuth(t *testing.T) {
+	var receivedHeaders http.Header
+	var mu sync.Mutex
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		receivedHeaders = r.Header.Clone()
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("backend-ok"))
+	}))
+	defer upstreamServer.Close()
+
+	cfg := &Config{
+		BlockPrivateIPs: false,
+		MaxRedirects:    5,
+		BufferSizeKB:    32,
+		BasicAuthUser:   "admin",
+		BasicAuthPass:   "supersecret",
+	}
+	proxy := NewProxyServer(cfg)
+
+	// 1. Unauthenticated request -> 401 Unauthorized
+	{
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Header().Get("WWW-Authenticate"), "Basic") {
+			t.Errorf("expected WWW-Authenticate: Basic header, got %q", rec.Header().Get("WWW-Authenticate"))
+		}
+	}
+
+	// 2. Invalid credentials -> 401 Unauthorized
+	{
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		badCred := base64.StdEncoding.EncodeToString([]byte("admin:wrongpass"))
+		req.Header.Set("Authorization", "Basic "+badCred)
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized for bad credentials, got %d", rec.Code)
+		}
+	}
+
+	// 3. Valid credentials via Authorization header -> 200 OK
+	{
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		validCred := base64.StdEncoding.EncodeToString([]byte("admin:supersecret"))
+		req.Header.Set("Authorization", "Basic "+validCred)
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+
+		mu.Lock()
+		headers := receivedHeaders.Clone()
+		mu.Unlock()
+
+		// Verify proxy credentials are NOT forwarded to upstream!
+		if headers.Get("Authorization") != "" {
+			t.Errorf("expected Authorization header to be stripped from upstream, got %q", headers.Get("Authorization"))
+		}
+	}
+
+	// 4. Valid credentials via Proxy-Authorization header, with custom Authorization for upstream
+	{
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		validCred := base64.StdEncoding.EncodeToString([]byte("admin:supersecret"))
+		req.Header.Set("Proxy-Authorization", "Basic "+validCred)
+		req.Header.Set("Authorization", "Bearer upstream-token-12345")
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+
+		mu.Lock()
+		headers := receivedHeaders.Clone()
+		mu.Unlock()
+
+		// Upstream should receive its own Authorization, and NOT Proxy-Authorization
+		if headers.Get("Authorization") != "Bearer upstream-token-12345" {
+			t.Errorf("expected upstream Authorization preserved, got %q", headers.Get("Authorization"))
+		}
+		if headers.Get("Proxy-Authorization") != "" {
+			t.Errorf("expected Proxy-Authorization stripped, got %q", headers.Get("Proxy-Authorization"))
+		}
+	}
+}
+
+func TestProxyServer_BearerAuth(t *testing.T) {
+	var receivedHeaders http.Header
+	var mu sync.Mutex
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		receivedHeaders = r.Header.Clone()
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("backend-ok"))
+	}))
+	defer upstreamServer.Close()
+
+	cfg := &Config{
+		BlockPrivateIPs: false,
+		MaxRedirects:    5,
+		BufferSizeKB:    32,
+		BearerTokens:    []string{"token-alpha", "token-beta"},
+	}
+	proxy := NewProxyServer(cfg)
+
+	// 1. Unauthenticated request -> 401 Unauthorized
+	{
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Header().Get("WWW-Authenticate"), "Bearer") {
+			t.Errorf("expected WWW-Authenticate: Bearer header, got %q", rec.Header().Get("WWW-Authenticate"))
+		}
+	}
+
+	// 2. Invalid token -> 401 Unauthorized
+	{
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		req.Header.Set("Authorization", "Bearer invalid-token")
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+	}
+
+	// 3. Valid token in Authorization header -> 200 OK
+	{
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		req.Header.Set("Authorization", "Bearer token-alpha")
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+
+		mu.Lock()
+		headers := receivedHeaders.Clone()
+		mu.Unlock()
+
+		// Proxy token stripped from upstream
+		if headers.Get("Authorization") != "" {
+			t.Errorf("expected Authorization stripped from upstream, got %q", headers.Get("Authorization"))
+		}
+	}
+
+	// 4. Valid token in Proxy-Authorization header
+	{
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		req.Header.Set("Proxy-Authorization", "Bearer token-beta")
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+	}
+
+	// 5. Valid token in X-Proxy-Token header, with upstream Authorization
+	{
+		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
+		req.Header.Set("X-Proxy-Token", "token-alpha")
+		req.Header.Set("Authorization", "Bearer sk-target-api-key")
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+
+		mu.Lock()
+		headers := receivedHeaders.Clone()
+		mu.Unlock()
+
+		// Upstream receives target Authorization, X-Proxy-Token is stripped
+		if headers.Get("Authorization") != "Bearer sk-target-api-key" {
+			t.Errorf("expected target Authorization preserved, got %q", headers.Get("Authorization"))
+		}
+		if headers.Get("X-Proxy-Token") != "" {
+			t.Errorf("expected X-Proxy-Token stripped from upstream, got %q", headers.Get("X-Proxy-Token"))
+		}
+	}
+}
+
+func TestProxyServer_HealthCheck_NoAuthRequired(t *testing.T) {
+	cfg := &Config{
+		BlockPrivateIPs: false,
+		MaxRedirects:    5,
+		BufferSizeKB:    32,
+		BasicAuthUser:   "admin",
+		BasicAuthPass:   "pass123",
+		BearerTokens:    []string{"token-xyz"},
+	}
+	proxy := NewProxyServer(cfg)
+
+	// Healthcheck must succeed without credentials
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /healthz, got %d", rec.Code)
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+		t.Fatalf("failed to parse json: %v", err)
+	}
+	if data["auth_enabled"] != true {
+		t.Errorf("expected auth_enabled true in healthz, got %v", data["auth_enabled"])
+	}
+}
+
 
 
 

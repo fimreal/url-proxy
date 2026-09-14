@@ -15,6 +15,7 @@
   - [2. 301/302 重定向跟随与零缓冲流式传输](#2-301302-重定向跟随与零缓冲流式传输)
   - [3. SSRF 防护与 DNS 重绑定防御体系](#3-ssrf-防护与-dns-重绑定防御体系)
   - [4. 高匿代理与客户端 IP 隐藏机制](#4-高匿代理与客户端-ip-隐藏机制)
+  - [5. 访问认证安全体系（Basic Auth & Bearer Auth）](#5-访问认证安全体系basic-auth--bearer-auth)
 - [环境变量配置参考](#环境变量配置参考)
 - [快速开始与部署场景](#快速开始与部署场景)
   - [场景一：本地直接运行](#场景一本地直接运行)
@@ -145,26 +146,43 @@
 > 1. 代理服务在向上游转发时会自动剥离所有内部控制头（`X-Forward-Client-IP`、`X-Hide-Client-IP` 等），绝不向目标服务端泄露任何内部标记。
 > 2. 目标 URL 路径与 Query 参数保持 100% 原始字节透传，完全不改变字符编码与参数顺序，兼容所有严格签名校验接口。
 
+### 5. 访问认证安全体系（Basic Auth & Bearer Auth）
+
+为了在公网或受限内网环境中保护代理服务不被滥用，服务原生支持 **Basic Auth（用户名/密码）** 与 **Bearer Auth（Token 令牌）** 双认证体系：
+
+- **默认状态**：未配置认证信息时，认证处于关闭状态（`auth_enabled: false`），开箱即用，免密访问。
+- **双通道配置**：同时支持环境变量（Docker 容器推荐）与启动参数命令行 Flag（本地二进制推荐）。
+- **上游目标凭证解耦与防泄漏**：
+  - 在转发 OpenAI、GitHub 私有 API 等场景中，上游目标服务器本身需要传递 `Authorization: Bearer sk-...`。
+  - 客户端使用标准代理头 `Proxy-Authorization` 或专用网关头 `X-Proxy-Token` / `X-Proxy-Auth` 进行代理鉴权时，代理将仅消费自己的鉴权头，并将目标所需的 `Authorization` **100% 完整原样透传给上游**。
+  - 若客户端直接使用 `Authorization` 认证代理，代理在转发时会**自动剥离该标头**，绝不将代理的内部凭证泄漏给外部目标服务器。
+- **常量时间防计时攻击**：底层采用 `crypto/subtle.ConstantTimeCompare` 进行凭据对比，防止侧信道计时分析（Timing Attack）。
+- **探针健康检查免认证**：`/healthz` 与 `/health` 探针接口始终保持公开访问，并在响应 JSON 中包含 `"auth_enabled": true/false`，确保 Kubernetes / Docker Compose 健康检查永不被 401 阻断。
+
 ---
 
-## 环境变量配置参考
+## 环境变量与启动参数配置参考
 
-所有行为均通过标准环境变量配置，无需任何复杂的配置文件：
+所有行为均支持通过环境变量（推荐容器环境）或 CLI 启动参数（推荐本地命令行）进行配置，CLI 启动参数优先级高于环境变量：
 
-| 环境变量 | 类型 | 默认值 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `PORT` | String | `8080` | 服务监听端口（如 `8080` 或 `:8080`） |
-| `ALLOW_DOMAINS` | String | 空或 `*`（默认放通所有公网） | 允许代理的目标域名列表，英文逗号分隔。支持通配符（如 `*.github.com,github.com`）或直接配置为 `*` 放通所有公网域名（仍受内网 SSRF 防护） |
-| `BLOCK_DOMAINS` | String | 空 | 阻断的目标域名列表，英文逗号分隔 |
-| `BLOCK_PRIVATE_IPS` | Boolean | `true` | 是否拦截私有网段/环回地址/云元数据（SSRF 防御） |
-| `HIDE_CLIENT_IP` | Boolean | `true` | **高匿代理模式**：是否隐藏客户端真实 IP（自动剥离 `X-Forwarded-For`、`X-Real-IP` 等识别头，目标端仅能看到代理 IP）。设为 `false` 可恢复透明代理 |
-| `FORWARD_CLIENT_IP` | Boolean | `false` | 与 `HIDE_CLIENT_IP` 语义相反，设为 `true` 时透传客户端 IP 到上游 |
-| `MAX_REDIRECTS` | Int | `10` | 允许跟随的最大 301/302 重定向次数。设为 `0` 则不跟随重定向，直接返回 302 |
-| `BUFFER_SIZE_KB` | Int | `32` | 流式传输缓冲区大小（单位 KB） |
-| `HTTP_PROXY` | String | 系统默认 | 上游代理配置（支持 HTTP 代理） |
-| `HTTPS_PROXY` | String | 系统默认 | 上游 HTTPS 代理配置 |
-| `ALL_PROXY` | String | 系统默认 | 上游全局代理（支持 `socks5://user:pass@host:port`） |
-| `NO_PROXY` | String | 系统默认 | 绕过上游代理的目标列表 |
+| 环境变量 | CLI 启动参数 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `PORT` | `-port` | String | `8080` | 服务监听端口（如 `8080` 或 `:8080`） |
+| `BASIC_AUTH` | `-basic-auth` | String | 空 | Basic Auth 认证凭证，格式为 `username:password` |
+| `BASIC_AUTH_USER` | `-basic-user` | String | 空 | Basic Auth 用户名（可与 `BASIC_AUTH_PASS` 搭配） |
+| `BASIC_AUTH_PASS` | `-basic-pass` | String | 空 | Basic Auth 密码 |
+| `BEARER_TOKEN` | `-bearer-token` / `-token` | String | 空 | Bearer Token 凭据，支持逗号分隔配置多个 Token（如 `token1,token2`） |
+| `ALLOW_DOMAINS` | `-allow-domains` | String | 空或 `*` | 允许代理的目标域名列表，英文逗号分隔。支持通配符（如 `*.github.com,github.com`）或 `*` 放通所有合法公网域名 |
+| `BLOCK_DOMAINS` | `-block-domains` | String | 空 | 阻断的目标域名列表，英文逗号分隔 |
+| `BLOCK_PRIVATE_IPS` | `-block-private-ips` | Boolean | `true` | 是否拦截私有网段/环回地址/云元数据（SSRF 防御） |
+| `HIDE_CLIENT_IP` | `-hide-client-ip` | Boolean | `true` | **高匿代理模式**：隐藏客户端真实 IP（自动剥离 `X-Forwarded-For`、`X-Real-IP` 等识别头，目标端仅能看到代理 IP） |
+| `FORWARD_CLIENT_IP` | - | Boolean | `false` | 与 `HIDE_CLIENT_IP` 语义相反，设为 `true` 时透传客户端 IP 到上游 |
+| `MAX_REDIRECTS` | `-max-redirects` | Int | `10` | 允许跟随的最大 301/302 重定向次数。设为 `0` 则不跟随重定向，直接返回 302 |
+| `BUFFER_SIZE_KB` | `-buffer-size-kb` | Int | `32` | 流式传输缓冲区大小（单位 KB） |
+| `HTTP_PROXY` | - | String | 系统默认 | 上游代理配置（支持 HTTP 代理） |
+| `HTTPS_PROXY` | - | String | 系统默认 | 上游 HTTPS 代理配置 |
+| `ALL_PROXY` | - | String | 系统默认 | 上游全局代理（支持 `socks5://user:pass@host:port`） |
+| `NO_PROXY` | - | String | 系统默认 | 绕过上游代理的目标列表 |
 
 ---
 
@@ -343,7 +361,28 @@ Content-Type: text/plain; charset=utf-8
 ...
 ```
 
-### 5. 健康检查
+### 5. 访问认证请求示例（开启 Basic Auth 或 Bearer Auth 时）
+
+```bash
+# 方式 A：标准 Basic Auth 请求
+curl -u admin:secret http://localhost:8080/https://api.github.com/user
+
+# 方式 B：标准 Bearer Token 请求
+curl -H "Authorization: Bearer my-secret-token" http://localhost:8080/https://api.github.com/user
+
+# 方式 C：使用 Proxy-Authorization 认证代理，同时携带目标 API 的 Authorization
+# （代理消费 Proxy-Authorization，并将 Authorization: Bearer sk-... 纯净透传给上游）
+curl -H "Proxy-Authorization: Bearer my-proxy-token" \
+     -H "Authorization: Bearer sk-openai-actual-key" \
+     http://localhost:8080/https://api.openai.com/v1/chat/completions
+
+# 方式 D：使用 X-Proxy-Token 专用标头认证代理
+curl -H "X-Proxy-Token: my-proxy-token" \
+     -H "Authorization: Bearer sk-openai-actual-key" \
+     http://localhost:8080/https://api.openai.com/v1/chat/completions
+```
+
+### 6. 健康检查（始终免认证）
 ```bash
 curl -s http://localhost:8080/healthz | jq .
 ```
@@ -354,7 +393,9 @@ curl -s http://localhost:8080/healthz | jq .
   "allow_domains": ["*.github.com", "github.com", "*.githubusercontent.com"],
   "block_domains": null,
   "block_private_ips": true,
-  "max_redirects": 10
+  "max_redirects": 10,
+  "hide_client_ip": true,
+  "auth_enabled": true
 }
 ```
 
@@ -375,4 +416,6 @@ go test -v -race -coverprofile=coverage.out .
 - [x] **域名控制**：白名单通配符匹配 (`*.github.com` 匹配 `raw.github.com` 及根域)、黑名单精确拦截、未授权域 403 阻断。
 - [x] **301/302 重定向**：真实 HTTP 模拟服务跳转跟随、跨跳转 `Range` 标头保留、`MaxRedirects=0` 原样返回跳转。
 - [x] **流式与断点续传**：大响应流式透传无内存缓存、HTTP 206 Partial Content 及 Content-Range 透传。
+- [x] **高匿模式与客户端自主选择**：默认隐藏客户端 IP、`X-Forward-Client-IP` 按需透传、Query 参数无损不侵入。
+- [x] **访问认证体系**：Basic Auth 环境变量与 CLI 参数加载、Bearer Token 多令牌比对、常量时间对比防计时攻击、上游目标凭据解耦透传、未授权 401 阻断与 WWW-Authenticate 标头、`/healthz` 探针免密放行。
 - [x] **健康检查与自检**：`-healthcheck` 原生自检旗标测试、Web 端图形化使用说明首页。
