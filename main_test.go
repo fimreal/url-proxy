@@ -392,8 +392,8 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.BufferSizeKB != 64 {
 		t.Errorf("expected buffer size 64, got %d", cfg.BufferSizeKB)
 	}
-	if !cfg.HideClientIP {
-		t.Errorf("expected HideClientIP to be true by default")
+	if cfg.HideClientIP {
+		t.Errorf("expected HideClientIP to be false by default")
 	}
 }
 
@@ -610,15 +610,23 @@ func TestProxyServer_SSEStreamingChatCompletion(t *testing.T) {
 }
 
 func TestLoadConfig_HideClientIP(t *testing.T) {
-	// 1. Explicit HIDE_CLIENT_IP=false
-	t.Setenv("HIDE_CLIENT_IP", "false")
+	// 1. Default when no env set: HideClientIP should be false (transparent IP passthrough)
+	t.Setenv("HIDE_CLIENT_IP", "")
 	t.Setenv("FORWARD_CLIENT_IP", "")
 	cfg := LoadConfig()
+	if cfg.HideClientIP != false {
+		t.Errorf("expected default HideClientIP false, got %v", cfg.HideClientIP)
+	}
+
+	// 2. Explicit HIDE_CLIENT_IP=false
+	t.Setenv("HIDE_CLIENT_IP", "false")
+	t.Setenv("FORWARD_CLIENT_IP", "")
+	cfg = LoadConfig()
 	if cfg.HideClientIP != false {
 		t.Errorf("expected HideClientIP false when HIDE_CLIENT_IP=false")
 	}
 
-	// 2. FORWARD_CLIENT_IP=true
+	// 3. FORWARD_CLIENT_IP=true
 	t.Setenv("HIDE_CLIENT_IP", "")
 	t.Setenv("FORWARD_CLIENT_IP", "true")
 	cfg = LoadConfig()
@@ -626,7 +634,7 @@ func TestLoadConfig_HideClientIP(t *testing.T) {
 		t.Errorf("expected HideClientIP false when FORWARD_CLIENT_IP=true")
 	}
 
-	// 3. HIDE_CLIENT_IP=true
+	// 4. HIDE_CLIENT_IP=true
 	t.Setenv("HIDE_CLIENT_IP", "true")
 	t.Setenv("FORWARD_CLIENT_IP", "true") // HIDE_CLIENT_IP takes precedence
 	cfg = LoadConfig()
@@ -688,7 +696,7 @@ func TestProxyServer_HideClientIP(t *testing.T) {
 			t.Errorf("expected User-Agent to be preserved, got %q", headers.Get("User-Agent"))
 		}
 
-		// Verify all client identifying headers are stripped
+		// Verify all client identifying headers and proxy info headers are stripped
 		disallowed := []string{
 			"X-Forwarded-For",
 			"X-Forwarded-Proto",
@@ -705,7 +713,7 @@ func TestProxyServer_HideClientIP(t *testing.T) {
 		}
 	}
 
-	// Case 2: HideClientIP is false (Transparent forwarding mode)
+	// Case 2: HideClientIP is false (Transparent forwarding mode - default)
 	{
 		cfg := &Config{
 			BlockPrivateIPs: false,
@@ -718,6 +726,9 @@ func TestProxyServer_HideClientIP(t *testing.T) {
 		req := httptest.NewRequest("GET", "/"+upstreamServer.URL+"/test", nil)
 		req.RemoteAddr = "198.51.100.10:54321"
 		req.Header.Set("X-Forwarded-For", "203.0.113.1")
+		req.Header.Set("X-Forwarded-Proto", "https")
+		req.Header.Set("Via", "1.1 other-proxy")
+		req.Header.Set("Forwarded", "for=1.1.1.1")
 
 		rec := httptest.NewRecorder()
 		proxy.ServeHTTP(rec, req)
@@ -735,8 +746,15 @@ func TestProxyServer_HideClientIP(t *testing.T) {
 		if !strings.Contains(xff, "198.51.100.10") {
 			t.Errorf("expected X-Forwarded-For to contain client remote addr, got %q", xff)
 		}
-		if headers.Get("X-Forwarded-Proto") == "" {
-			t.Errorf("expected X-Forwarded-Proto to be set in transparent mode")
+		// Proxy information headers must NOT be sent to upstream
+		if val := headers.Get("X-Forwarded-Proto"); val != "" {
+			t.Errorf("expected no X-Forwarded-Proto in upstream request, got %q", val)
+		}
+		if val := headers.Get("Via"); val != "" {
+			t.Errorf("expected no Via header in upstream request, got %q", val)
+		}
+		if val := headers.Get("Forwarded"); val != "" {
+			t.Errorf("expected no Forwarded header in upstream request, got %q", val)
 		}
 	}
 }

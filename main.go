@@ -99,7 +99,7 @@ func LoadConfig(args ...string) *Config {
 		}
 	}
 
-	hideClientIP := true
+	hideClientIP := false
 	if val := os.Getenv("HIDE_CLIENT_IP"); val != "" {
 		if b, err := strconv.ParseBool(val); err == nil {
 			hideClientIP = b
@@ -411,17 +411,12 @@ var hopByHopHeaders = map[string]bool{
 // Client IP identifying headers stripped when HideClientIP is enabled (high-anonymity proxy mode)
 var clientIPHeaders = map[string]bool{
 	http.CanonicalHeaderKey("X-Forwarded-For"):     true,
-	http.CanonicalHeaderKey("X-Forwarded-Proto"):   true,
-	http.CanonicalHeaderKey("X-Forwarded-Host"):    true,
-	http.CanonicalHeaderKey("X-Forwarded-Port"):    true,
-	http.CanonicalHeaderKey("X-Forwarded-Server"):  true,
 	http.CanonicalHeaderKey("X-Real-IP"):           true,
 	http.CanonicalHeaderKey("X-Client-IP"):         true,
 	http.CanonicalHeaderKey("CF-Connecting-IP"):    true,
 	http.CanonicalHeaderKey("True-Client-IP"):      true,
 	http.CanonicalHeaderKey("Fastly-Client-IP"):    true,
 	http.CanonicalHeaderKey("X-Cluster-Client-IP"): true,
-	http.CanonicalHeaderKey("Forwarded"):           true,
 }
 
 // Proxy control headers stripped from upstream requests to prevent leaking proxy instructions
@@ -433,6 +428,18 @@ var proxyControlHeaders = map[string]bool{
 	http.CanonicalHeaderKey("X-Proxy-Token"):       true,
 	http.CanonicalHeaderKey("X-Proxy-Auth"):        true,
 	http.CanonicalHeaderKey("X-Token"):             true,
+}
+
+// Proxy information headers stripped from upstream requests to avoid leaking proxy traces.
+// The proxy forwards client IP transparently without appending proxy-specific protocol or server headers.
+var proxyInfoHeaders = map[string]bool{
+	http.CanonicalHeaderKey("X-Forwarded-Proto"):  true,
+	http.CanonicalHeaderKey("X-Forwarded-Host"):   true,
+	http.CanonicalHeaderKey("X-Forwarded-Port"):   true,
+	http.CanonicalHeaderKey("X-Forwarded-Server"): true,
+	http.CanonicalHeaderKey("Forwarded"):          true,
+	http.CanonicalHeaderKey("Via"):                true,
+	http.CanonicalHeaderKey("Proxy-Connection"):   true,
 }
 
 // NormalizeTargetURL extracts and repairs target URL from request paths.
@@ -747,7 +754,7 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 
 	for key, values := range r.Header {
 		canonicalKey := http.CanonicalHeaderKey(key)
-		if hopByHopHeaders[canonicalKey] || proxyControlHeaders[canonicalKey] {
+		if hopByHopHeaders[canonicalKey] || proxyControlHeaders[canonicalKey] || proxyInfoHeaders[canonicalKey] {
 			continue
 		}
 		if hideClientIP && clientIPHeaders[canonicalKey] {
@@ -761,9 +768,11 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 		}
 	}
 
-	// Set target Host header and forwarding headers
+	// Set target Host header
 	upstreamReq.Host = targetURL.Host
 
+	// Forward client IP if hideClientIP is disabled (default).
+	// Proxy information headers (X-Forwarded-Proto, Via, Forwarded, etc.) are NOT attached to upstream.
 	if !hideClientIP {
 		remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
@@ -778,11 +787,6 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 			if upstreamReq.Header.Get("X-Real-IP") == "" {
 				upstreamReq.Header.Set("X-Real-IP", remoteIP)
 			}
-		}
-		if r.TLS != nil {
-			upstreamReq.Header.Set("X-Forwarded-Proto", "https")
-		} else {
-			upstreamReq.Header.Set("X-Forwarded-Proto", "http")
 		}
 	}
 
@@ -994,18 +998,17 @@ AUTHENTICATION HEADERS (When Basic Auth or Bearer Token is enabled):
       automatically stripped before forwarding to prevent credential leakage.
 
 -------------------------------------------------------------------------------
-CLIENT IP & PRIVACY HEADERS (High-Anonymity Mode):
+CLIENT IP & PRIVACY HEADERS (Transparent by default):
 -------------------------------------------------------------------------------
-  The proxy operates in high-anonymity mode by default (HIDE_CLIENT_IP=true).
-  Identifying headers (X-Forwarded-For, X-Real-IP, etc.) are stripped so the
-  target server only sees the proxy's IP.
+  By default, the proxy forwards the client IP (X-Forwarded-For, X-Real-IP)
+  without attaching proxy metadata (e.g. X-Forwarded-Proto, Via) to upstream.
 
   Per-request header controls:
-  - Forward client real IP to target:
-      curl -H "X-Forward-Client-IP: true" http://%s/<target-url>
-
-  - Hide client real IP (default):
+  - Hide client real IP (High-Anonymity mode):
       curl -H "X-Hide-Client-IP: true" http://%s/<target-url>
+
+  - Forward client real IP (default behavior):
+      curl -H "X-Forward-Client-IP: true" http://%s/<target-url>
 
 -------------------------------------------------------------------------------
 UTILITY ENDPOINTS:
