@@ -392,8 +392,8 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.BufferSizeKB != 64 {
 		t.Errorf("expected buffer size 64, got %d", cfg.BufferSizeKB)
 	}
-	if cfg.HideClientIP {
-		t.Errorf("expected HideClientIP to be false by default")
+	if !cfg.HideClientIP {
+		t.Errorf("expected HideClientIP to be true by default")
 	}
 }
 
@@ -610,12 +610,12 @@ func TestProxyServer_SSEStreamingChatCompletion(t *testing.T) {
 }
 
 func TestLoadConfig_HideClientIP(t *testing.T) {
-	// 1. Default when no env set: HideClientIP should be false (transparent IP passthrough)
+	// 1. Default when no env set: HideClientIP should be true (Scheme 2 - high-anonymity default)
 	t.Setenv("HIDE_CLIENT_IP", "")
 	t.Setenv("FORWARD_CLIENT_IP", "")
 	cfg := LoadConfig()
-	if cfg.HideClientIP != false {
-		t.Errorf("expected default HideClientIP false, got %v", cfg.HideClientIP)
+	if cfg.HideClientIP != true {
+		t.Errorf("expected default HideClientIP true, got %v", cfg.HideClientIP)
 	}
 
 	// 2. Explicit HIDE_CLIENT_IP=false

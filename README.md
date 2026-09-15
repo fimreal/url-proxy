@@ -121,24 +121,24 @@
 
 ### 4. 客户端 IP 透传与无代理痕迹机制
 
-默认情况下，本项目**默认开启客户端真实 IP 透传（Transparent IP Passthrough）**，同时**绝不向上游后端附加代理痕迹信息**：
-- **默认透传 IP**（`HIDE_CLIENT_IP=false`）：
-  - 自动向目标上游传递客户端真实 IP（`X-Forwarded-For: <client_ip>` 与 `X-Real-IP: <client_ip>`）。
-  - **绝不添加 proxy 痕迹信息**：自动剥离并杜绝向后端发送 `X-Forwarded-Proto`、`X-Forwarded-Host`、`X-Forwarded-Port`、`X-Forwarded-Server`、`Forwarded`、`Via` 等代理标识头，使上游目标端收到的请求干净纯粹，避免触发重定向循环或代理风控。
-- **高匿模式**：若需要完全隐藏客户端真实 IP，可通过配置环境变量 `HIDE_CLIENT_IP=true`（或 `FORWARD_CLIENT_IP=false`）开启高匿代理，此时目标端仅能看到代理服务器自身的出网 IP。
+默认情况下，本项目**默认开启高匿代理模式（High-Anonymity Mode）**，同时**绝不向上游后端附加代理痕迹信息**：
+- **默认高匿模式**（`HIDE_CLIENT_IP=true`）：
+  - 自动剥离 `X-Forwarded-For`、`X-Real-IP`、`CF-Connecting-IP` 等客户端真实 IP 标识。目标端仅能看到代理服务器自身的出网 IP。
+  - **绝不添加 proxy 痕迹信息**：自动剥离并杜绝向后端发送 `X-Forwarded-Proto`、`X-Forwarded-Host`、`X-Forwarded-Port`、`X-Forwarded-Server`、`Forwarded`、`Via`、`Proxy-Connection` 等代理标识头，使上游目标端收到的请求干净纯粹，完全像直接发起的 HTTP 请求，避免触发重定向循环或代理风控。
+- **按需透传真实 IP**：若需要向上游传递客户端真实 IP，可通过请求头传入 `X-Forward-Client-IP: true`（或 `X-Forward-IP: true`），或在服务端配置环境变量 `HIDE_CLIENT_IP=false`（或 `FORWARD_CLIENT_IP=true`），此时服务将附加 `X-Forwarded-For: <client_ip>` 与 `X-Real-IP: <client_ip>`。
 
 #### 客户端自主选择（通过 HTTP 请求头动态切换）
 
-除了服务端全局环境变量配置外，**客户端亦可在发起请求时按需自主决定是否隐藏真实 IP**。为保障目标 URL 的绝对纯净（避免破坏 AWS S3 等对象的预签名 URL 校验），本项目**仅通过 HTTP 请求头**提供控制，绝不侵入或修改目标 URL 的 Query 参数：
+除了服务端全局环境变量配置外，**客户端亦可在发起请求时按需自主决定是否透传真实 IP**。为保障目标 URL 的绝对纯净（避免破坏 AWS S3 等对象的预签名 URL 校验），本项目**仅通过 HTTP 请求头**提供控制，绝不侵入或修改目标 URL 的 Query 参数：
 
-- **隐藏真实客户端 IP（高匿模式）**：在请求头中加入 `X-Hide-Client-IP: true`
-  ```bash
-  curl -H "X-Hide-Client-IP: true" http://10.0.0.10:18080/https://httpbin.org/ip
-  # 目标端响应仅展示代理出口 IP
-  ```
-- **携带真实客户端 IP（默认行为）**：默认请求无需任何参数，或显式传入 `X-Forward-Client-IP: true`
+- **默认行为（高匿模式）**：无需任何多余参数，默认隐藏真实 IP 并剥离所有代理特征头
   ```bash
   curl http://10.0.0.10:18080/https://httpbin.org/ip
+  # 目标端响应仅展示代理出口 IP
+  ```
+- **携带真实客户端 IP**：在请求头中加入 `X-Forward-Client-IP: true`
+  ```bash
+  curl -H "X-Forward-Client-IP: true" http://10.0.0.10:18080/https://httpbin.org/ip
   # 目标端响应包含客户端真实 IP
   ```
 
@@ -175,8 +175,8 @@
 | `ALLOW_DOMAINS` | `-allow-domains` | String | 空或 `*` | 允许代理的目标域名列表，英文逗号分隔。支持通配符（如 `*.github.com,github.com`）或 `*` 放通所有合法公网域名 |
 | `BLOCK_DOMAINS` | `-block-domains` | String | 空 | 阻断的目标域名列表，英文逗号分隔 |
 | `BLOCK_PRIVATE_IPS` | `-block-private-ips` | Boolean | `true` | 是否拦截私有网段/环回地址/云元数据（SSRF 防御） |
-| `HIDE_CLIENT_IP` | `-hide-client-ip` | Boolean | `false` | **高匿代理模式**：是否隐藏客户端真实 IP（默认 `false`，即默认透传真实 IP 且不附加任何 proxy 标记信息） |
-| `FORWARD_CLIENT_IP` | - | Boolean | `true` | 与 `HIDE_CLIENT_IP` 语义相反，默认 `true` 透传客户端 IP |
+| `HIDE_CLIENT_IP` | `-hide-client-ip` | Boolean | `true` | **高匿代理模式**：是否隐藏客户端真实 IP（默认 `true`，即默认不向后端传递真实 IP 且不附加任何 proxy 标记信息） |
+| `FORWARD_CLIENT_IP` | - | Boolean | `false` | 与 `HIDE_CLIENT_IP` 语义相反，默认 `false` |
 | `MAX_REDIRECTS` | `-max-redirects` | Int | `10` | 允许跟随的最大 301/302 重定向次数。设为 `0` 则不跟随重定向，直接返回 302 |
 | `BUFFER_SIZE_KB` | `-buffer-size-kb` | Int | `32` | 流式传输缓冲区大小（单位 KB） |
 | `HTTP_PROXY` | - | String | 系统默认 | 上游代理配置（支持 HTTP 代理） |

@@ -99,7 +99,7 @@ func LoadConfig(args ...string) *Config {
 		}
 	}
 
-	hideClientIP := false
+	hideClientIP := true
 	if val := os.Getenv("HIDE_CLIENT_IP"); val != "" {
 		if b, err := strconv.ParseBool(val); err == nil {
 			hideClientIP = b
@@ -998,17 +998,19 @@ AUTHENTICATION HEADERS (When Basic Auth or Bearer Token is enabled):
       automatically stripped before forwarding to prevent credential leakage.
 
 -------------------------------------------------------------------------------
-CLIENT IP & PRIVACY HEADERS (Transparent by default):
+CLIENT IP & PRIVACY HEADERS (High-Anonymity by default):
 -------------------------------------------------------------------------------
-  By default, the proxy forwards the client IP (X-Forwarded-For, X-Real-IP)
-  without attaching proxy metadata (e.g. X-Forwarded-Proto, Via) to upstream.
+  By default, the proxy operates in high-anonymity mode (HIDE_CLIENT_IP=true).
+  All client identifying headers (X-Forwarded-For, X-Real-IP, etc.) and proxy
+  metadata (X-Forwarded-Proto, Via) are stripped. The upstream server only sees
+  the proxy's IP.
 
   Per-request header controls:
-  - Hide client real IP (High-Anonymity mode):
-      curl -H "X-Hide-Client-IP: true" http://%s/<target-url>
-
-  - Forward client real IP (default behavior):
+  - Forward client real IP to upstream:
       curl -H "X-Forward-Client-IP: true" http://%s/<target-url>
+
+  - Hide client real IP (default behavior):
+      curl http://%s/<target-url>
 
 -------------------------------------------------------------------------------
 UTILITY ENDPOINTS:
