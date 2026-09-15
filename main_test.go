@@ -1,16 +1,26 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNormalizeTargetURL(t *testing.T) {
@@ -1335,6 +1345,313 @@ func TestIsCommandLineClient(t *testing.T) {
 	}
 }
 
+func TestResolveListenAddr(t *testing.T) {
+	tests := []struct {
+		name     string
+		host     string
+		port     string
+		bind     string
+		addr     string
+		expected string
+	}{
+		{
+			name:     "Default empty host and 8080 port",
+			host:     "",
+			port:     "8080",
+			expected: ":8080",
+		},
+		{
+			name:     "Port with leading colon",
+			host:     "",
+			port:     ":8080",
+			expected: ":8080",
+		},
+		{
+			name:     "Host 127.0.0.1 and port 8080",
+			host:     "127.0.0.1",
+			port:     "8080",
+			expected: "127.0.0.1:8080",
+		},
+		{
+			name:     "Host 127.0.0.1 and port :8080",
+			host:     "127.0.0.1",
+			port:     ":8080",
+			expected: "127.0.0.1:8080",
+		},
+		{
+			name:     "Host 127.0.0.1 without port specified",
+			host:     "127.0.0.1",
+			port:     "",
+			expected: "127.0.0.1:8080",
+		},
+		{
+			name:     "Port contains host 127.0.0.1:8080",
+			host:     "",
+			port:     "127.0.0.1:8080",
+			expected: "127.0.0.1:8080",
+		},
+		{
+			name:     "Explicit bind address with port",
+			bind:     "127.0.0.1:8443",
+			expected: "127.0.0.1:8443",
+		},
+		{
+			name:     "Explicit bind host only",
+			bind:     "127.0.0.1",
+			port:     "9000",
+			expected: "127.0.0.1:9000",
+		},
+		{
+			name:     "Explicit addr alias with port",
+			addr:     "127.0.0.1:9090",
+			expected: "127.0.0.1:9090",
+		},
+	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveListenAddr(tt.host, tt.port, tt.bind, tt.addr)
+			if got != tt.expected {
+				t.Errorf("resolveListenAddr(%q, %q, %q, %q) = %q; want %q", tt.host, tt.port, tt.bind, tt.addr, got, tt.expected)
+			}
+		})
+	}
+}
 
+func TestLoadConfig_ListenAddressAndTLS(t *testing.T) {
+	// 1. Test HOST and PORT via flags
+	cfg1 := LoadConfig("-host", "127.0.0.1", "-port", "8080")
+	if cfg1.Host != "127.0.0.1" || cfg1.Port != "127.0.0.1:8080" {
+		t.Errorf("expected host 127.0.0.1 and port 127.0.0.1:8080, got host=%q port=%q", cfg1.Host, cfg1.Port)
+	}
 
+	// 2. Test -bind flag
+	cfg2 := LoadConfig("-bind", "127.0.0.1:9090")
+	if cfg2.Port != "127.0.0.1:9090" {
+		t.Errorf("expected port 127.0.0.1:9090 from -bind, got %q", cfg2.Port)
+	}
+
+	// 3. Test -addr flag
+	cfg3 := LoadConfig("-addr", "127.0.0.1:9091")
+	if cfg3.Port != "127.0.0.1:9091" {
+		t.Errorf("expected port 127.0.0.1:9091 from -addr, got %q", cfg3.Port)
+	}
+
+	// 4. Test HOST and PORT via environment variables
+	t.Setenv("HOST", "127.0.0.1")
+	t.Setenv("PORT", "8888")
+	cfg4 := LoadConfig()
+	if cfg4.Host != "127.0.0.1" || cfg4.Port != "127.0.0.1:8888" {
+		t.Errorf("expected host 127.0.0.1 and port 127.0.0.1:8888 from env, got host=%q port=%q", cfg4.Host, cfg4.Port)
+	}
+	t.Setenv("HOST", "")
+	t.Setenv("PORT", "")
+
+	// 5. Test TLS flags
+	cfg5 := LoadConfig("-tls-cert", "/etc/ssl/cert.pem", "-tls-key", "/etc/ssl/key.pem", "-insecure")
+	if cfg5.TLSCertFile != "/etc/ssl/cert.pem" || cfg5.TLSKeyFile != "/etc/ssl/key.pem" {
+		t.Errorf("unexpected TLS config: cert=%q key=%q", cfg5.TLSCertFile, cfg5.TLSKeyFile)
+	}
+	if !cfg5.TLSEnabled() {
+		t.Errorf("expected TLSEnabled() to be true")
+	}
+	if !cfg5.InsecureSkipTLS {
+		t.Errorf("expected InsecureSkipTLS to be true")
+	}
+
+	// 6. Test -help flag
+	cfg6 := LoadConfig("-help")
+	if !cfg6.HelpRequested {
+		t.Errorf("expected HelpRequested to be true when -help passed")
+	}
+}
+
+func TestPrintCLIHelp(t *testing.T) {
+	var buf bytes.Buffer
+	PrintCLIHelp(&buf)
+	out := buf.String()
+
+	requiredSubstrings := []string{
+		"Universal URL Proxy (url-proxy)",
+		"USAGE:",
+		"LISTEN & ADDRESS OPTIONS:",
+		"-host",
+		"-port",
+		"-bind",
+		"TLS / HTTPS OPTIONS:",
+		"-tls-cert",
+		"-tls-key",
+		"-insecure",
+		"-hide-client-ip",
+		"-h, -help, --help",
+		"EXAMPLES:",
+		"127.0.0.1",
+	}
+
+	for _, req := range requiredSubstrings {
+		if !strings.Contains(out, req) {
+			t.Errorf("PrintCLIHelp output missing expected string: %q", req)
+		}
+	}
+}
+
+func TestProxyServer_BehindReverseProxy_SchemeAndIP(t *testing.T) {
+	cfg := &Config{
+		BlockPrivateIPs: false,
+		MaxRedirects:    5,
+		BufferSizeKB:    32,
+		HideClientIP:    true, // Default Scheme 2
+	}
+	proxy := NewProxyServer(cfg)
+
+	// 1. GET /help with X-Forwarded-Proto: https
+	req := httptest.NewRequest("GET", "/help", nil)
+	req.Host = "proxy.example.com"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	helpBody := rec.Body.String()
+	if !strings.Contains(helpBody, "https://proxy.example.com/") {
+		t.Errorf("expected help output to reflect https scheme from X-Forwarded-Proto, got:\n%s", helpBody)
+	}
+
+	// 2. Client IP extraction when behind reverse proxy on 127.0.0.1
+	var receivedRealIP, receivedXFF string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedRealIP = r.Header.Get("X-Real-IP")
+		receivedXFF = r.Header.Get("X-Forwarded-For")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	// Request arrives from 127.0.0.1 (reverse proxy), with X-Real-IP and X-Forward-Client-IP: true
+	reqProxy := httptest.NewRequest("GET", "/"+backend.URL, nil)
+	reqProxy.RemoteAddr = "127.0.0.1:45678"
+	reqProxy.Header.Set("X-Real-IP", "203.0.113.195")
+	reqProxy.Header.Set("X-Forward-Client-IP", "true")
+
+	recProxy := httptest.NewRecorder()
+	proxy.ServeHTTP(recProxy, reqProxy)
+
+	if recProxy.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from backend, got %d", recProxy.Code)
+	}
+	if receivedRealIP != "203.0.113.195" {
+		t.Errorf("expected upstream to receive client IP 203.0.113.195 from reverse proxy, got %q", receivedRealIP)
+	}
+	if receivedXFF != "203.0.113.195" {
+		t.Errorf("expected upstream X-Forwarded-For to be 203.0.113.195, got %q", receivedXFF)
+	}
+}
+
+func TestHTTPServer_TLSAndLocalhost(t *testing.T) {
+	// Generate self-signed certificate and private key in memory
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate RSA key: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"URL Proxy Test"},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	certFile, err := os.CreateTemp("", "url-proxy-cert-*.pem")
+	if err != nil {
+		t.Fatalf("failed to create temp cert file: %v", err)
+	}
+	defer os.Remove(certFile.Name())
+
+	keyFile, err := os.CreateTemp("", "url-proxy-key-*.pem")
+	if err != nil {
+		t.Fatalf("failed to create temp key file: %v", err)
+	}
+	defer os.Remove(keyFile.Name())
+
+	if err := pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
+		t.Fatalf("failed to write cert: %v", err)
+	}
+	certFile.Close()
+
+	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("failed to marshal private key: %v", err)
+	}
+	if err := pem.Encode(keyFile, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}); err != nil {
+		t.Fatalf("failed to write key: %v", err)
+	}
+	keyFile.Close()
+
+	// Spin up server listening on 127.0.0.1 with random available port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on 127.0.0.1: %v", err)
+	}
+	defer listener.Close()
+
+	listenAddr := listener.Addr().String()
+
+	cfg := &Config{
+		Host:            "127.0.0.1",
+		Port:            listenAddr,
+		TLSCertFile:     certFile.Name(),
+		TLSKeyFile:      keyFile.Name(),
+		BlockPrivateIPs: false,
+		MaxRedirects:    5,
+		BufferSizeKB:    32,
+	}
+
+	proxy := NewProxyServer(cfg)
+	server := &http.Server{
+		Handler: proxy,
+	}
+
+	go func() {
+		_ = server.ServeTLS(listener, certFile.Name(), keyFile.Name())
+	}()
+	defer server.Close()
+
+	// Make HTTPS request to 127.0.0.1
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Get(fmt.Sprintf("https://%s/healthz", listenAddr))
+	if err != nil {
+		t.Fatalf("failed to send HTTPS request to %s: %v", listenAddr, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from TLS server, got %d", resp.StatusCode)
+	}
+
+	var health map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatalf("failed to decode healthz json: %v", err)
+	}
+	if health["status"] != "ok" || health["tls_enabled"] != true {
+		t.Errorf("unexpected healthz response: %v", health)
+	}
+}

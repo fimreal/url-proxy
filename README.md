@@ -167,7 +167,12 @@
 
 | 环境变量 | CLI 启动参数 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| `PORT` | `-port` | String | `8080` | 服务监听端口（如 `8080` 或 `:8080`） |
+| `HOST` | `-host` | String | 空（绑定全网卡） | 监听的主机或网卡 IP（如 `127.0.0.1` 本地回环或 `0.0.0.0`） |
+| `PORT` | `-port` | String | `8080` | 服务监听端口或地址（如 `8080`、`:8080` 或 `127.0.0.1:8080`） |
+| `BIND` / `ADDR` | `-bind` / `-addr` | String | 空 | 完整监听地址别名（如 `127.0.0.1:8080`） |
+| `TLS_CERT_FILE` / `TLS_CERT` | `-tls-cert` | String | 空 | 服务端 TLS 证书文件路径（配置后启用原生 HTTPS 监听） |
+| `TLS_KEY_FILE` / `TLS_KEY` | `-tls-key` | String | 空 | 服务端 TLS 私钥文件路径 |
+| `INSECURE_SKIP_VERIFY` | `-insecure` | Boolean | `false` | 是否跳过针对上游目标服务器的 TLS 证书合法性校验（开发/内网环境测试） |
 | `BASIC_AUTH` | `-basic-auth` | String | 空 | Basic Auth 认证凭证，格式为 `username:password` |
 | `BASIC_AUTH_USER` | `-basic-user` | String | 空 | Basic Auth 用户名（可与 `BASIC_AUTH_PASS` 搭配） |
 | `BASIC_AUTH_PASS` | `-basic-pass` | String | 空 | Basic Auth 密码 |
@@ -251,6 +256,82 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+```
+
+### 场景三：监听在 127.0.0.1 并配合 Nginx 反向代理配置 TLS（推荐生产架构）
+
+将 `url-proxy` 绑定于本地回环地址 `127.0.0.1`，仅对本机暴露端口，外部流量由 Nginx / Caddy 统一进行 TLS 卸载与反向代理：
+
+#### 1. 启动服务监听在 127.0.0.1
+```bash
+# 方式 A：通过命令行参数指定
+./url-proxy -host 127.0.0.1 -port 8080
+# 或使用完整别名
+./url-proxy -bind 127.0.0.1:8080
+
+# 方式 B：通过环境变量指定（容器/systemd 推荐）
+HOST=127.0.0.1 PORT=8080 ./url-proxy
+
+# 方式 C：Docker 映射至本机 127.0.0.1
+docker run -d \
+  --name url-proxy \
+  --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -e ALLOW_DOMAINS="*" \
+  -e MAX_REDIRECTS=10 \
+  epurs/url-proxy:latest
+```
+
+#### 2. Nginx 反向代理与 TLS 终结配置示例
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name proxy.yourdomain.com;
+
+    # SSL 证书配置
+    ssl_certificate     /etc/nginx/ssl/proxy.yourdomain.com.crt;
+    ssl_certificate_key /etc/nginx/ssl/proxy.yourdomain.com.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # 禁用客户端请求体缓冲以支持大文件流式上传
+    proxy_request_buffering off;
+    # 禁用响应缓冲以支持 LLM SSE 实时流式响应与大文件断点续传
+    proxy_buffering off;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+
+        # 传递标准反向代理请求头
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+
+        # WebSocket / 长连接支持
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}
+```
+> **架构优势**：
+> 1. `url-proxy` 智能识别前置反向代理传递的 `X-Forwarded-Proto: https`，终端手册 `curl /help` 与根路径 HTML 说明自动切换为 HTTPS 协议链接。
+> 2. 当需要按需透传真实 IP 时，服务自动从 Nginx 传递的 `X-Real-IP` 中提取真正客户端 IP，避免误将 `127.0.0.1` 当作客户端地址。
+
+---
+
+### 场景四：直接启用原生 TLS / HTTPS 服务
+
+若无需前置反代，亦可由 `url-proxy` 直接加载证书监听 HTTPS：
+
+```bash
+# 方式 A：通过命令行参数指定证书与密钥
+./url-proxy -port :8443 -tls-cert /path/to/cert.pem -tls-key /path/to/key.pem
+
+# 方式 B：通过环境变量指定
+PORT=8443 TLS_CERT_FILE=/path/to/cert.pem TLS_KEY_FILE=/path/to/key.pem ./url-proxy
 ```
 
 ---
@@ -413,9 +494,21 @@ curl -s http://localhost:8080/healthz | jq .
 }
 ```
 
-### 7. 终端命令行快速帮助手册（curl /help）
+### 7. 终端命令行快速帮助手册（CLI --help 与 curl /help）
 
-无需查阅网页文档，任何时候在终端执行 `curl /help`（或使用 curl 直接访问根路径 `/`）即可即时输出完整的英文格式化使用指南与标头说明：
+#### 1. 二进制 CLI 启动参数帮助（--help / -h）
+
+在终端中执行 `--help`、`-help` 或 `-h`，即可即时打印完整的命令行参数选项、环境变量配置及常用架构示例：
+
+```bash
+./url-proxy --help
+```
+
+输出内容包含地址绑定（`-host`, `-port`, `-bind`, `-addr`）、TLS/HTTPS 配置（`-tls-cert`, `-tls-key`, `-insecure`）、域名过滤、认证参数及 Nginx 反代配置参考。
+
+#### 2. HTTP 终端在线手册（curl /help）
+
+无需查阅网页文档，任何时候在终端执行 `curl /help`（或使用 curl 直接访问根路径 `/`）即可即时输出完整的英文格式化使用指南与标头说明（支持自适应反向代理的 HTTPS 协议）：
 
 ```bash
 curl http://localhost:8080/help
@@ -444,5 +537,7 @@ go test -v -race -coverprofile=coverage.out .
 - [x] **流式与断点续传**：大响应流式透传无内存缓存、HTTP 206 Partial Content 及 Content-Range 透传。
 - [x] **高匿模式与客户端自主选择**：默认隐藏客户端 IP、`X-Forward-Client-IP` 按需透传、Query 参数无损不侵入。
 - [x] **访问认证体系**：Basic Auth 环境变量与 CLI 参数加载、Bearer Token 多令牌比对、常量时间对比防计时攻击、上游目标凭据解耦透传、未授权 401 阻断与 WWW-Authenticate 标头、`/healthz` 探针免密放行。
-- [x] **命令行即时手册**：`/help` 纯文本格式化输出、CLI（curl/wget/httpie）智能探测、未认证访问豁免保障。
+- [x] **命令行即时手册与 CLI 帮助**：`--help` 格式化参数手册、`/help` 纯文本格式化输出、CLI（curl/wget/httpie）智能探测、未认证访问豁免保障。
+- [x] **本地监听与反向代理配合**：支持 `-host 127.0.0.1` / `HOST=127.0.0.1` 绑定特定接口、识别前置反代 `X-Forwarded-Proto` 自适应切换 HTTPS、识别反代 `X-Real-IP` 智能提取真实客户端地址。
+- [x] **原生 TLS 与 HTTPS 支持**：`-tls-cert` 与 `-tls-key` 原生加载证书监听 HTTPS、`-insecure` 支持开发/内网跳过证书校验。
 - [x] **健康检查与自检**：`-healthcheck` 原生自检旗标测试、Web 端图形化使用说明首页。

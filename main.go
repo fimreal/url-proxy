@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -27,13 +28,18 @@ var (
 
 // Config stores the runtime configuration loaded from environment variables and CLI flags.
 type Config struct {
-	Port            string
+	Host            string
+	Port            string // Final listen address (e.g. ":8080" or "127.0.0.1:8080")
+	TLSCertFile     string
+	TLSKeyFile      string
+	InsecureSkipTLS bool
 	AllowDomains    []string
 	BlockDomains    []string
 	BlockPrivateIPs bool
 	MaxRedirects    int
 	BufferSizeKB    int
 	HideClientIP    bool
+	HelpRequested   bool
 
 	// Authentication configuration
 	BasicAuthUser string
@@ -46,14 +52,86 @@ func (c *Config) AuthEnabled() bool {
 	return (c.BasicAuthUser != "" && c.BasicAuthPass != "") || len(c.BearerTokens) > 0
 }
 
+// TLSEnabled returns true if both TLS cert and key are configured.
+func (c *Config) TLSEnabled() bool {
+	return c.TLSCertFile != "" && c.TLSKeyFile != ""
+}
+
+// resolveListenAddr normalizes host, port, bind, and addr settings into a valid net.Listen address.
+func resolveListenAddr(host, port, bind, addr string) string {
+	target := strings.TrimSpace(bind)
+	if target == "" {
+		target = strings.TrimSpace(addr)
+	}
+
+	// 1. If explicit bind/addr is given:
+	if target != "" {
+		if strings.Contains(target, ":") {
+			return target
+		}
+		p := strings.TrimSpace(port)
+		if p == "" {
+			p = "8080"
+		}
+		p = strings.TrimPrefix(p, ":")
+		return net.JoinHostPort(target, p)
+	}
+
+	// 2. If host is given:
+	h := strings.TrimSpace(host)
+	p := strings.TrimSpace(port)
+	if p == "" {
+		p = "8080"
+	}
+
+	if h != "" {
+		if strings.Contains(p, ":") && !strings.HasPrefix(p, ":") {
+			return p
+		}
+		p = strings.TrimPrefix(p, ":")
+		return net.JoinHostPort(h, p)
+	}
+
+	// 3. Only port is given:
+	if strings.HasPrefix(p, ":") {
+		return p
+	}
+	if strings.Contains(p, ":") {
+		return p
+	}
+	return ":" + p
+}
+
 // LoadConfig initializes configuration from environment variables and optional CLI flags.
 func LoadConfig(args ...string) *Config {
+	host := os.Getenv("HOST")
 	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	bind := os.Getenv("BIND")
+	if bind == "" {
+		bind = os.Getenv("ADDR")
 	}
-	if !strings.HasPrefix(port, ":") {
-		port = ":" + port
+	if bind == "" {
+		bind = os.Getenv("LISTEN_ADDR")
+	}
+
+	tlsCert := os.Getenv("TLS_CERT_FILE")
+	if tlsCert == "" {
+		tlsCert = os.Getenv("TLS_CERT")
+	}
+	tlsKey := os.Getenv("TLS_KEY_FILE")
+	if tlsKey == "" {
+		tlsKey = os.Getenv("TLS_KEY")
+	}
+
+	insecureSkipTLS := false
+	if val := os.Getenv("INSECURE_SKIP_VERIFY"); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			insecureSkipTLS = b
+		}
+	} else if val := os.Getenv("TLS_INSECURE_SKIP_VERIFY"); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			insecureSkipTLS = b
+		}
 	}
 
 	allowDomainsStr := os.Getenv("ALLOW_DOMAINS")
@@ -144,12 +222,20 @@ func LoadConfig(args ...string) *Config {
 		}
 	}
 
+	helpRequested := false
+
 	// CLI flags override / augment
 	if len(args) > 0 {
 		fs := flag.NewFlagSet("url-proxy", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)
 
-		portFlag := fs.String("port", "", "Service listen port (e.g. 8080 or :8080)")
+		hostFlag := fs.String("host", "", "Host/IP interface to bind to (e.g. 127.0.0.1)")
+		portFlag := fs.String("port", "", "Service listen port or address (e.g. 8080 or 127.0.0.1:8080)")
+		bindFlag := fs.String("bind", "", "Alias for listen address (e.g. 127.0.0.1:8080)")
+		addrFlag := fs.String("addr", "", "Alias for listen address (e.g. 127.0.0.1:8080)")
+		tlsCertFlag := fs.String("tls-cert", "", "Path to TLS cert file")
+		tlsKeyFlag := fs.String("tls-key", "", "Path to TLS key file")
+		insecureFlag := fs.Bool("insecure", false, "Skip upstream TLS certificate verification")
 		allowDomainsFlag := fs.String("allow-domains", "", "Allowed domains comma-separated")
 		blockDomainsFlag := fs.String("block-domains", "", "Blocked domains comma-separated")
 		blockPrivateIPsFlag := fs.String("block-private-ips", "", "Block private IPs (true/false)")
@@ -163,14 +249,31 @@ func LoadConfig(args ...string) *Config {
 		bearerAuthFlag := fs.String("bearer-auth", "", "Bearer token(s), comma-separated")
 		tokenFlag := fs.String("token", "", "Bearer token(s), comma-separated")
 
-		_ = fs.Parse(args)
+		err := fs.Parse(args)
+		if err == flag.ErrHelp {
+			helpRequested = true
+		}
 
+		if *hostFlag != "" {
+			host = *hostFlag
+		}
 		if *portFlag != "" {
-			p := *portFlag
-			if !strings.HasPrefix(p, ":") {
-				p = ":" + p
-			}
-			port = p
+			port = *portFlag
+		}
+		if *bindFlag != "" {
+			bind = *bindFlag
+		}
+		if *addrFlag != "" {
+			bind = *addrFlag
+		}
+		if *tlsCertFlag != "" {
+			tlsCert = *tlsCertFlag
+		}
+		if *tlsKeyFlag != "" {
+			tlsKey = *tlsKeyFlag
+		}
+		if *insecureFlag {
+			insecureSkipTLS = true
 		}
 		if *allowDomainsFlag != "" {
 			allowDomains = nil
@@ -236,14 +339,21 @@ func LoadConfig(args ...string) *Config {
 		}
 	}
 
+	finalAddr := resolveListenAddr(host, port, bind, "")
+
 	return &Config{
-		Port:            port,
+		Host:            host,
+		Port:            finalAddr,
+		TLSCertFile:     tlsCert,
+		TLSKeyFile:      tlsKey,
+		InsecureSkipTLS: insecureSkipTLS,
 		AllowDomains:    allowDomains,
 		BlockDomains:    blockDomains,
 		BlockPrivateIPs: blockPrivateIPs,
 		MaxRedirects:    maxRedirects,
 		BufferSizeKB:    bufferSizeKB,
 		HideClientIP:    hideClientIP,
+		HelpRequested:   helpRequested,
 		BasicAuthUser:   basicAuthUser,
 		BasicAuthPass:   basicAuthPass,
 		BearerTokens:    bearerTokens,
@@ -570,6 +680,9 @@ func NewProxyServer(cfg *Config) *ProxyServer {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: cfg.InsecureSkipTLS,
+		},
 	}
 
 	client := &http.Client{
@@ -603,6 +716,22 @@ func NewProxyServer(cfg *Config) *ProxyServer {
 	}
 }
 
+// determineRequestScheme detects if the incoming request was made over HTTPS
+// either directly (TLS) or via a reverse proxy (X-Forwarded-Proto).
+func determineRequestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		parts := strings.Split(proto, ",")
+		p := strings.ToLower(strings.TrimSpace(parts[0]))
+		if p == "https" || p == "http" {
+			return p
+		}
+	}
+	return "http"
+}
+
 // ServeHTTP handles incoming requests, validates security, and streams responses.
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. Health check endpoint (always unauthenticated for orchestrator liveness/readiness probes)
@@ -612,6 +741,9 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":            "ok",
 			"version":           Version,
+			"host":              p.cfg.Host,
+			"port":              p.cfg.Port,
+			"tls_enabled":       p.cfg.TLSEnabled(),
 			"allow_domains":    p.cfg.AllowDomains,
 			"block_domains":    p.cfg.BlockDomains,
 			"block_private_ips": p.cfg.BlockPrivateIPs,
@@ -622,11 +754,13 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scheme := determineRequestScheme(r)
+
 	// 2. Help manual endpoint (always unauthenticated plain-text guide for curl / CLI)
 	if r.URL.Path == "/help" || r.URL.Path == "/help/" || r.URL.Query().Has("help") {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(HelpText(r.Host)))
+		w.Write([]byte(HelpText(r.Host, scheme)))
 		return
 	}
 
@@ -635,7 +769,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if isCommandLineClient(r.UserAgent()) {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(HelpText(r.Host)))
+			w.Write([]byte(HelpText(r.Host, scheme)))
 			return
 		}
 
@@ -659,13 +793,13 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 <div class="card">
 <h3>使用方式</h3>
 <p>在当前服务地址后直接追加完整目标 URL：</p>
-<pre>http://%s/https://github.com/torvalds/linux/archive/refs/tags/v6.0.tar.gz</pre>
+<pre>%s://%s/https://github.com/torvalds/linux/archive/refs/tags/v6.0.tar.gz</pre>
 </div>
 
 <div class="card">
 <h3>命令行手册 (curl /help)</h3>
 <p>在终端直接执行 curl 命令即可查看包含所有认证与控制标头的英文帮助手册：</p>
-<pre>curl http://%s/help</pre>
+<pre>curl %s://%s/help</pre>
 </div>
 
 <div class="card">
@@ -682,7 +816,7 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 
 <p><small>Health Check: <a href="/healthz">/healthz</a> | Text Help: <a href="/help">/help</a></small></p>
 </body>
-</html>`, r.Host, r.Host)
+</html>`, scheme, r.Host, scheme, r.Host)
 		return
 	}
 
@@ -779,13 +913,25 @@ pre { background: #f8f9fa; padding: 12px; border-radius: 6px; border-left: 4px s
 			remoteIP = r.RemoteAddr
 		}
 		if remoteIP != "" {
-			xff := remoteIP
-			if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
+			clientRealIP := remoteIP
+			// If incoming request is from local loopback (e.g. reverse proxy on 127.0.0.1),
+			// inspect X-Real-IP or X-Forwarded-For passed from the reverse proxy.
+			if remoteIP == "127.0.0.1" || remoteIP == "::1" {
+				if xri := r.Header.Get("X-Real-IP"); xri != "" {
+					clientRealIP = strings.TrimSpace(xri)
+				} else if xffPrior := r.Header.Get("X-Forwarded-For"); xffPrior != "" {
+					parts := strings.Split(xffPrior, ",")
+					clientRealIP = strings.TrimSpace(parts[0])
+				}
+			}
+
+			xff := clientRealIP
+			if prior := r.Header.Get("X-Forwarded-For"); prior != "" && remoteIP != "127.0.0.1" && remoteIP != "::1" {
 				xff = prior + ", " + remoteIP
 			}
 			upstreamReq.Header.Set("X-Forwarded-For", xff)
 			if upstreamReq.Header.Get("X-Real-IP") == "" {
-				upstreamReq.Header.Set("X-Real-IP", remoteIP)
+				upstreamReq.Header.Set("X-Real-IP", clientRealIP)
 			}
 		}
 	}
@@ -946,7 +1092,11 @@ func isCommandLineClient(userAgent string) bool {
 }
 
 // HelpText returns a formatted plain-text user manual for terminal/CLI users.
-func HelpText(host string) string {
+func HelpText(host string, schemeOpt ...string) string {
+	scheme := "http"
+	if len(schemeOpt) > 0 && schemeOpt[0] != "" {
+		scheme = schemeOpt[0]
+	}
 	if host == "" {
 		host = "10.0.0.10:18080"
 	}
@@ -955,17 +1105,17 @@ func HelpText(host string) string {
 ===============================================================================
 
 USAGE:
-  curl [OPTIONS] http://%s/<target-url>
+  curl [OPTIONS] %s://%s/<target-url>
 
 BASIC EXAMPLES:
   # 1. Download a GitHub Release asset or raw file
-  curl -LO http://%s/https://github.com/torvalds/linux/archive/refs/tags/v6.0.tar.gz
+  curl -LO %s://%s/https://github.com/torvalds/linux/archive/refs/tags/v6.0.tar.gz
 
   # 2. Resumable download / Range request (HTTP 206 Partial Content)
-  curl -H "Range: bytes=0-1023" http://%s/https://example.com/largefile.zip
+  curl -H "Range: bytes=0-1023" %s://%s/https://example.com/largefile.zip
 
   # 3. Model API forwarding (OpenAI / Claude / Groq streaming or non-streaming)
-  curl -X POST http://%s/https://api.openai.com/v1/chat/completions \
+  curl -X POST %s://%s/https://api.openai.com/v1/chat/completions \
     -H "Authorization: Bearer sk-your-api-key" \
     -H "Content-Type: application/json" \
     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
@@ -991,9 +1141,9 @@ AUTHENTICATION HEADERS (When Basic Auth or Bearer Token is enabled):
 
   Option C: Standard Authorization Header (Single-tier proxy usage)
     - Basic Auth:
-        curl -u user:pass http://%s/<target-url>
+        curl -u user:pass %s://%s/<target-url>
     - Bearer Token:
-        curl -H "Authorization: Bearer <proxy-token>" http://%s/<target-url>
+        curl -H "Authorization: Bearer <proxy-token>" %s://%s/<target-url>
     * Security: If used to authenticate to the proxy alone, this header is
       automatically stripped before forwarding to prevent credential leakage.
 
@@ -1007,10 +1157,10 @@ CLIENT IP & PRIVACY HEADERS (High-Anonymity by default):
 
   Per-request header controls:
   - Forward client real IP to upstream:
-      curl -H "X-Forward-Client-IP: true" http://%s/<target-url>
+      curl -H "X-Forward-Client-IP: true" %s://%s/<target-url>
 
   - Hide client real IP (default behavior):
-      curl http://%s/<target-url>
+      curl %s://%s/<target-url>
 
 -------------------------------------------------------------------------------
 UTILITY ENDPOINTS:
@@ -1019,22 +1169,147 @@ UTILITY ENDPOINTS:
   GET /healthz  - Health check & runtime status (JSON, always unauthenticated)
 
 ===============================================================================
-`, host, host, host, host, host, host, host, host)
+`, scheme, host, scheme, host, scheme, host, scheme, host, scheme, host, scheme, host, scheme, host, scheme, host)
+}
+
+// PrintCLIHelp outputs the command-line flags and environment variables manual.
+func PrintCLIHelp(w io.Writer) {
+	fmt.Fprintf(w, `Universal URL Proxy (url-proxy) - Lightweight URL Path Forwarding Service
+
+USAGE:
+  url-proxy [OPTIONS]
+
+LISTEN & ADDRESS OPTIONS:
+  -host string
+        Host or IP interface to bind to (e.g. "127.0.0.1", "0.0.0.0")
+        [env: HOST]
+  -port string
+        Port or address to listen on (e.g. "8080", ":8080", "127.0.0.1:8080") (default ":8080")
+        [env: PORT]
+  -bind string, -addr string
+        Alias for listen address (e.g. "127.0.0.1:8080", "127.0.0.1")
+        [env: BIND, ADDR, LISTEN_ADDR]
+
+TLS / HTTPS OPTIONS:
+  -tls-cert string
+        Path to TLS certificate file (enables HTTPS server)
+        [env: TLS_CERT_FILE, TLS_CERT]
+  -tls-key string
+        Path to TLS private key file (enables HTTPS server)
+        [env: TLS_KEY_FILE, TLS_KEY]
+  -insecure
+        Skip TLS certificate verification for upstream HTTPS targets (default false)
+        [env: INSECURE_SKIP_VERIFY, TLS_INSECURE_SKIP_VERIFY]
+
+ACCESS CONTROL & SSRF PROTECTION:
+  -allow-domains string
+        Comma-separated list of allowed target domains (supports wildcards, e.g. "*.github.com")
+        [env: ALLOW_DOMAINS] (default: allow all if empty or "*")
+  -block-domains string
+        Comma-separated list of blocked target domains
+        [env: BLOCK_DOMAINS]
+  -block-private-ips
+        Block private/internal IP ranges to prevent SSRF and DNS rebinding (default true)
+        [env: BLOCK_PRIVATE_IPS]
+
+AUTHENTICATION OPTIONS:
+  -basic-auth string
+        Basic Auth credentials in "username:password" format
+        [env: BASIC_AUTH]
+  -basic-user string
+        Basic Auth username [env: BASIC_AUTH_USER]
+  -basic-pass string
+        Basic Auth password [env: BASIC_AUTH_PASS, BASIC_AUTH_PASSWORD]
+  -bearer-token string, -token string
+        Bearer token(s), comma-separated for multiple tokens
+        [env: BEARER_TOKEN, BEARER_AUTH, AUTH_TOKEN, TOKEN]
+
+PROXY & STREAMING OPTIONS:
+  -hide-client-ip
+        Hide client real IP & strip proxy metadata (high-anonymity mode) (default true)
+        [env: HIDE_CLIENT_IP]
+  -max-redirects int
+        Maximum HTTP 301/302 redirects to follow (0 = do not follow) (default 10)
+        [env: MAX_REDIRECTS]
+  -buffer-size-kb int
+        Streaming buffer size in kilobytes (default 32)
+        [env: BUFFER_SIZE_KB]
+
+UTILITIES & INFO:
+  -h, -help, --help
+        Show this help message and exit
+  -v, -version, --version
+        Show version information and exit
+  -healthcheck
+        Execute a local health check against the running server and exit (0 = ok, 1 = fail)
+
+EXAMPLES:
+  # 1. Listen on all interfaces on port 8080 (default)
+  url-proxy
+
+  # 2. Listen on 127.0.0.1:8080 (for reverse proxy frontend like Nginx/Caddy)
+  url-proxy -host 127.0.0.1 -port 8080
+  # Or via environment variables:
+  HOST=127.0.0.1 PORT=8080 url-proxy
+
+  # 3. Direct TLS / HTTPS server
+  url-proxy -port :8443 -tls-cert /path/to/cert.pem -tls-key /path/to/key.pem
+  # Or via environment variables:
+  PORT=8443 TLS_CERT_FILE=/path/to/cert.pem TLS_KEY_FILE=/path/to/key.pem url-proxy
+
+  # 4. Behind an Nginx reverse proxy with TLS (listening on 127.0.0.1)
+  # Nginx upstream config snippet:
+  #   server {
+  #       listen 443 ssl;
+  #       server_name proxy.example.com;
+  #       ssl_certificate /path/to/cert.pem;
+  #       ssl_certificate_key /path/to/key.pem;
+  #       location / {
+  #           proxy_pass http://127.0.0.1:8080;
+  #           proxy_set_header Host $host;
+  #           proxy_set_header X-Real-IP $remote_addr;
+  #           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  #           proxy_set_header X-Forwarded-Proto $scheme;
+  #       }
+  #   }
+`)
 }
 
 func main() {
+	// Intercept help flags immediately
+	for _, arg := range os.Args[1:] {
+		if arg == "-h" || arg == "-help" || arg == "--help" {
+			PrintCLIHelp(os.Stdout)
+			os.Exit(0)
+		}
+	}
+
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "-version", "--version", "-v":
 			fmt.Printf("url-proxy %s (commit: %s, built: %s)\n", Version, CommitSHA, BuildDate)
 			os.Exit(0)
 		case "-healthcheck":
-			port := os.Getenv("PORT")
-			if port == "" {
-				port = "8080"
+			cfg := LoadConfig(os.Args[1:]...)
+			healthURL := "http://127.0.0.1:8080/healthz"
+			if cfg.Port != "" {
+				addr := cfg.Port
+				if strings.HasPrefix(addr, ":") {
+					addr = "127.0.0.1" + addr
+				}
+				scheme := "http"
+				if cfg.TLSEnabled() {
+					scheme = "https"
+				}
+				healthURL = fmt.Sprintf("%s://%s/healthz", scheme, addr)
 			}
-			port = strings.TrimPrefix(port, ":")
-			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%s/healthz", port))
+			client := &http.Client{Timeout: 5 * time.Second}
+			if strings.HasPrefix(healthURL, "https") {
+				client.Transport = &http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				}
+			}
+			resp, err := client.Get(healthURL)
 			if err != nil || resp.StatusCode != http.StatusOK {
 				os.Exit(1)
 			}
@@ -1043,11 +1318,24 @@ func main() {
 	}
 
 	cfg := LoadConfig(os.Args[1:]...)
+	if cfg.HelpRequested {
+		PrintCLIHelp(os.Stdout)
+		os.Exit(0)
+	}
+
+	if (cfg.TLSCertFile != "" && cfg.TLSKeyFile == "") || (cfg.TLSCertFile == "" && cfg.TLSKeyFile != "") {
+		log.Fatalf("Fatal: both -tls-cert and -tls-key (or TLS_CERT_FILE and TLS_KEY_FILE) must be specified to enable TLS")
+	}
+
 	server := NewProxyServer(cfg)
 
-	log.Printf("Starting Universal URL Proxy on %s ...", cfg.Port)
-	log.Printf("Config: AllowDomains=%v, BlockDomains=%v, BlockPrivateIPs=%v, MaxRedirects=%d, BufferSizeKB=%d, HideClientIP=%v, AuthEnabled=%v",
-		cfg.AllowDomains, cfg.BlockDomains, cfg.BlockPrivateIPs, cfg.MaxRedirects, cfg.BufferSizeKB, cfg.HideClientIP, cfg.AuthEnabled())
+	proto := "http"
+	if cfg.TLSEnabled() {
+		proto = "https"
+	}
+	log.Printf("Starting Universal URL Proxy on %s://%s ...", proto, cfg.Port)
+	log.Printf("Config: Host=%q, Port=%q, TLSEnabled=%v, AllowDomains=%v, BlockDomains=%v, BlockPrivateIPs=%v, MaxRedirects=%d, BufferSizeKB=%d, HideClientIP=%v, AuthEnabled=%v, InsecureSkipTLS=%v",
+		cfg.Host, cfg.Port, cfg.TLSEnabled(), cfg.AllowDomains, cfg.BlockDomains, cfg.BlockPrivateIPs, cfg.MaxRedirects, cfg.BufferSizeKB, cfg.HideClientIP, cfg.AuthEnabled(), cfg.InsecureSkipTLS)
 
 	httpServer := &http.Server{
 		Addr:         cfg.Port,
@@ -1057,7 +1345,14 @@ func main() {
 		WriteTimeout: 0, // Disable write timeout for unbounded streaming responses
 	}
 
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Server failed: %v", err)
+	if cfg.TLSEnabled() {
+		log.Printf("TLS enabled. Listening HTTPS on %s (cert: %s, key: %s)", cfg.Port, cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err := httpServer.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("TLS Server failed: %v", err)
+		}
+	} else {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
 	}
 }
